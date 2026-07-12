@@ -1,0 +1,1057 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Bulk Tracker</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body { -webkit-font-smoothing: antialiased; }
+  button { font-family: inherit; }
+  input, textarea { font-family: inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
+
+/* ============================== CONSTANTS ============================== */
+
+const GITHUB_API = "https://api.github.com";
+const GIST_FILENAME = "bulk-tracker-data.json";
+const LS_AUTH = "bulkTrackerAuth_v1";
+const LS_CACHE = "bulkTrackerCache_v1";
+
+const START_WEIGHT = 60.5;
+const TARGET_WEIGHT = 70;
+const START_DATE = "2026-07-11";
+const SHAKE_MACROS = { kcal: 955, protein: 58, carbs: 77, fat: 50 };
+const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+const SKIP_REASONS = [
+  { id: "work",   label: "💼 Heavy work / on-call" },
+  { id: "social", label: "🎉 Social reasons" },
+  { id: "lazy",   label: "😴 Lazy" },
+  { id: "injury", label: "🤕 Injury" },
+  { id: "other",  label: "🔘 Other" },
+];
+
+const SESSIONS = [
+  { id: "upper1", label: "Upper Day 1" },
+  { id: "lower1", label: "Lower Day 1" },
+  { id: "upper2", label: "Upper Day 2" },
+  { id: "lower2", label: "Lower Day 2" },
+];
+
+const p = {
+  bg: "#f5f5f0", white: "#ffffff", border: "#e4e4dc",
+  text: "#18181a", muted: "#86868c", dim: "#c8c8c0",
+  green: "#1a7f45", greenLight: "#edfaf3", greenBorder: "#a8e6c0",
+  blue: "#1d4ed8", blueLight: "#eff4ff", blueBorder: "#bdd0fe",
+  amber: "#b45309", amberLight: "#fffbeb", amberBorder: "#fde68a",
+  red: "#c0392b", redLight: "#fef2f0", redBorder: "#fdc5c0",
+  purple: "#6d28d9",
+};
+
+/* ============================== DATE HELPERS ============================== */
+
+function getSundayOfWeek(dateStr) {
+  const d = new Date(dateStr + "T00:00:00");
+  d.setDate(d.getDate() - d.getDay());
+  return d.toISOString().split("T")[0];
+}
+function todayStr() { return new Date().toISOString().split("T")[0]; }
+function fmtShort(dateStr) {
+  return new Date(dateStr + "T00:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+}
+function getAllWeekKeys(logs) {
+  return Object.keys(logs).filter(k => k >= START_DATE && logs[k]?.weight).sort();
+}
+function getPast16Weeks() {
+  const result = new Set();
+  const d = new Date(todayStr() + "T00:00:00");
+  for (let i = 0; i < 16; i++) {
+    result.add(getSundayOfWeek(d.toISOString().split("T")[0]));
+    d.setDate(d.getDate() - 7);
+  }
+  return [...result].sort();
+}
+function getDaysInMonth(year, month) {
+  const days = [];
+  const d = new Date(year, month, 1);
+  while (d.getMonth() === month) {
+    days.push(d.toISOString().split("T")[0]);
+    d.setDate(d.getDate() + 1);
+  }
+  return days;
+}
+function getShakeStatus(logs, weekKey, dayIdx) {
+  const shakes = (logs[weekKey] || {}).shakes || {};
+  return { morning: !!shakes[`morning_${dayIdx}`], night: !!shakes[`night_${dayIdx}`] };
+}
+
+/* ============================== CLOUD SYNC (GitHub Gist) ============================== */
+/*
+  Data is stored in a private GitHub Gist owned by the user.
+  Why: it's free, effectively permanent, and the GitHub REST API supports
+  CORS so this static page can talk to it directly with no server of its own.
+  A local cache (localStorage) is written SYNCHRONOUSLY on every change, so
+  data survives the app/tab being killed even before the cloud write completes.
+  On load, whichever copy (local cache vs cloud) has the newer timestamp wins,
+  and the other is overwritten to match - this is how multi-device sync works.
+*/
+
+function authHeaders(token) {
+  return {
+    "Authorization": `token ${token}`,
+    "Accept": "application/vnd.github+json",
+    "Content-Type": "application/json",
+  };
+}
+
+async function createGist(token, initialPayload) {
+  const res = await fetch(`${GITHUB_API}/gists`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify({
+      description: "Bulk Tracker data — managed by app, please don't delete",
+      public: false,
+      files: { [GIST_FILENAME]: { content: JSON.stringify(initialPayload) } },
+    }),
+  });
+  if (!res.ok) throw new Error("create-failed-" + res.status);
+  const json = await res.json();
+  return json.id;
+}
+
+async function fetchGistPayload(token, gistId) {
+  const res = await fetch(`${GITHUB_API}/gists/${gistId}`, { headers: authHeaders(token) });
+  if (res.status === 401 || res.status === 403) throw new Error("unauthorized");
+  if (res.status === 404) throw new Error("not-found");
+  if (!res.ok) throw new Error("fetch-failed-" + res.status);
+  const json = await res.json();
+  const file = json.files && json.files[GIST_FILENAME];
+  if (!file) throw new Error("bad-format");
+  let content = file.content;
+  if (file.truncated) {
+    const raw = await fetch(file.raw_url);
+    content = await raw.text();
+  }
+  return JSON.parse(content);
+}
+
+async function updateGistPayload(token, gistId, payload) {
+  const res = await fetch(`${GITHUB_API}/gists/${gistId}`, {
+    method: "PATCH",
+    headers: authHeaders(token),
+    body: JSON.stringify({ files: { [GIST_FILENAME]: { content: JSON.stringify(payload) } } }),
+  });
+  if (res.status === 401 || res.status === 403) throw new Error("unauthorized");
+  if (!res.ok) throw new Error("update-failed-" + res.status);
+  return true;
+}
+
+function makeSyncCode(token, gistId) {
+  return btoa(JSON.stringify({ t: token, g: gistId }));
+}
+function parseSyncCode(code) {
+  const obj = JSON.parse(atob(code.trim()));
+  if (!obj.t || !obj.g) throw new Error("bad-code");
+  return { token: obj.t, gistId: obj.g };
+}
+
+function readLocalAuth() {
+  try { return JSON.parse(localStorage.getItem(LS_AUTH)); } catch (e) { return null; }
+}
+function writeLocalAuth(auth) {
+  try { localStorage.setItem(LS_AUTH, JSON.stringify(auth)); } catch (e) {}
+}
+function clearLocalAuth() {
+  try { localStorage.removeItem(LS_AUTH); localStorage.removeItem(LS_CACHE); } catch (e) {}
+}
+function readLocalCache() {
+  try { return JSON.parse(localStorage.getItem(LS_CACHE)); } catch (e) { return null; }
+}
+function writeLocalCache(payload) {
+  try { localStorage.setItem(LS_CACHE, JSON.stringify(payload)); } catch (e) {}
+}
+
+/* ============================== SMALL SVG WEIGHT CHART ============================== */
+/* Hand-rolled instead of pulling in a charting library — one less thing that can
+   fail to load and break the whole app. */
+
+function WeightChart({ data, target }) {
+  if (!data.length) {
+    return <div style={{ textAlign: "center", color: p.dim, padding: "40px 0", fontSize: 13 }}>No data yet.</div>;
+  }
+  const width = 400, height = 220;
+  const pad = { top: 14, right: 18, bottom: 24, left: 30 };
+  const weights = data.map(d => d.weight);
+  const minY = Math.min(59, Math.min(...weights) - 1);
+  const maxY = Math.max(71, Math.max(...weights) + 1, target + 1);
+  const innerW = width - pad.left - pad.right;
+  const innerH = height - pad.top - pad.bottom;
+  const xStep = data.length > 1 ? innerW / (data.length - 1) : 0;
+  const xPos = i => pad.left + (data.length > 1 ? i * xStep : innerW / 2);
+  const yPos = v => pad.top + innerH * (1 - (v - minY) / (maxY - minY));
+  const pathD = data.map((d, i) => `${i === 0 ? "M" : "L"} ${xPos(i).toFixed(1)} ${yPos(d.weight).toFixed(1)}`).join(" ");
+  const gridVals = [0, 0.25, 0.5, 0.75, 1].map(f => minY + f * (maxY - minY));
+  const labelEvery = Math.max(1, Math.ceil(data.length / 6));
+
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height: "auto", display: "block" }}>
+      {gridVals.map((gy, i) => (
+        <line key={i} x1={pad.left} x2={width - pad.right} y1={yPos(gy)} y2={yPos(gy)} stroke={p.border} strokeDasharray="2 5" />
+      ))}
+      <line x1={pad.left} x2={width - pad.right} y1={yPos(target)} y2={yPos(target)} stroke={p.green} strokeDasharray="5 3" strokeOpacity="0.6" />
+      <text x={width - pad.right} y={yPos(target) - 4} textAnchor="end" fontSize="9" fill={p.green}>{target} kg</text>
+      <path d={pathD} fill="none" stroke={p.blue} strokeWidth="2.5" />
+      {data.map((d, i) => <circle key={i} cx={xPos(i)} cy={yPos(d.weight)} r="4" fill={p.blue} />)}
+      {data.map((d, i) => (i % labelEvery === 0 || i === data.length - 1) && (
+        <text key={"l" + i} x={xPos(i)} y={height - 6} textAnchor="middle" fontSize="9" fill={p.muted}>{d.week}</text>
+      ))}
+    </svg>
+  );
+}
+
+/* ============================== ONBOARDING ============================== */
+
+function Onboarding({ onReady }) {
+  const [mode, setMode] = useState("choose"); // choose | newtoken | existingcode
+  const [tokenInput, setTokenInput] = useState("");
+  const [codeInput, setCodeInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [freshCode, setFreshCode] = useState(null);
+  const [copied, setCopied] = useState(false);
+
+  async function handleCreateNew() {
+    if (!tokenInput.trim()) { setErr("Paste your GitHub token first."); return; }
+    setBusy(true); setErr("");
+    try {
+      const token = tokenInput.trim();
+      const initialPayload = { updatedAt: new Date().toISOString(), logs: {} };
+      const gistId = await createGist(token, initialPayload);
+      const auth = { token, gistId };
+      writeLocalAuth(auth);
+      writeLocalCache(initialPayload);
+      setFreshCode(makeSyncCode(token, gistId));
+      window.__btAuth = auth;
+    } catch (e) {
+      setErr("Couldn't create your tracker. Double-check the token has the 'gist' permission, then try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleConnectExisting() {
+    if (!codeInput.trim()) { setErr("Paste your Sync Code first."); return; }
+    setBusy(true); setErr("");
+    try {
+      const auth = parseSyncCode(codeInput);
+      await fetchGistPayload(auth.token, auth.gistId); // verify it works
+      writeLocalAuth(auth);
+      onReady(auth);
+    } catch (e) {
+      setErr("That Sync Code didn't work. Make sure you copied the whole thing.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const cardStyle = { background: p.white, border: `1px solid ${p.border}`, borderRadius: 14, padding: 20, maxWidth: 440, margin: "0 auto" };
+  const btnPrimary = { width: "100%", padding: "12px 16px", background: p.blue, border: "none", borderRadius: 9, color: "#fff", fontWeight: 600, fontSize: 14, cursor: "pointer" };
+  const btnGhost = { width: "100%", padding: "12px 16px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 9, color: p.text, fontWeight: 500, fontSize: 14, cursor: "pointer", marginTop: 8 };
+  const inputStyle = { width: "100%", padding: "10px 12px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, fontSize: 13, marginTop: 10 };
+
+  if (freshCode) {
+    return (
+      <div style={{ minHeight: "100vh", background: p.bg, display: "flex", alignItems: "center", padding: 20 }}>
+        <div style={cardStyle}>
+          <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>✅ Tracker created</div>
+          <div style={{ fontSize: 13, color: p.muted, marginBottom: 14 }}>
+            Save this Sync Code somewhere safe (Notes app, password manager). Paste it into the app on any other device to see the same data there.
+          </div>
+          <textarea readOnly value={freshCode} rows={3} style={{ ...inputStyle, marginTop: 0, fontFamily: "monospace", fontSize: 11, resize: "none" }} onClick={e => e.target.select()} />
+          <button style={{ ...btnPrimary, marginTop: 10 }} onClick={() => {
+            navigator.clipboard?.writeText(freshCode).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); });
+          }}>{copied ? "✓ Copied" : "Copy Sync Code"}</button>
+          <button style={btnGhost} onClick={() => onReady(window.__btAuth)}>Continue to my tracker →</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: p.bg, display: "flex", alignItems: "center", padding: 20 }}>
+      <div style={cardStyle}>
+        <div style={{ fontSize: 10, letterSpacing: 4, color: p.muted, textTransform: "uppercase", fontWeight: 600, marginBottom: 6 }}>Bulk Tracker</div>
+        <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 14 }}>Set up cloud sync</div>
+
+        {mode === "choose" && (
+          <>
+            <div style={{ fontSize: 13, color: p.muted, marginBottom: 16, lineHeight: 1.5 }}>
+              Your data is stored in a private GitHub Gist so it survives closing the app and works on every device you use.
+            </div>
+            <button style={btnPrimary} onClick={() => setMode("newtoken")}>🆕 First device — set up new tracker</button>
+            <button style={btnGhost} onClick={() => setMode("existingcode")}>🔗 I already have a Sync Code</button>
+          </>
+        )}
+
+        {mode === "newtoken" && (
+          <>
+            <div style={{ fontSize: 13, color: p.muted, marginBottom: 10, lineHeight: 1.5 }}>
+              One-time setup — takes about a minute:
+              <ol style={{ margin: "8px 0 0", paddingLeft: 18 }}>
+                <li style={{ marginBottom: 4 }}>Tap the button below to open GitHub's token page (opens in a new tab).</li>
+                <li style={{ marginBottom: 4 }}>Scroll down, make sure only <strong>gist</strong> is checked.</li>
+                <li style={{ marginBottom: 4 }}>Set expiration to "No expiration" and click <strong>Generate token</strong>.</li>
+                <li>Copy the token (starts with <code>ghp_</code>) and paste it below.</li>
+              </ol>
+            </div>
+            <a href="https://github.com/settings/tokens/new?scopes=gist&description=Bulk%20Tracker" target="_blank" rel="noopener noreferrer"
+              style={{ display: "block", textAlign: "center", padding: "10px 16px", background: p.text, color: "#fff", borderRadius: 9, fontSize: 13, fontWeight: 600, textDecoration: "none" }}>
+              Open GitHub token page ↗
+            </a>
+            <input type="password" placeholder="ghp_xxxxxxxxxxxx" value={tokenInput} onChange={e => setTokenInput(e.target.value)} style={inputStyle} />
+            {err && <div style={{ color: p.red, fontSize: 12, marginTop: 8 }}>{err}</div>}
+            <button style={{ ...btnPrimary, marginTop: 10, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={handleCreateNew}>
+              {busy ? "Creating..." : "Create my tracker"}
+            </button>
+            <button style={btnGhost} onClick={() => { setMode("choose"); setErr(""); }}>← Back</button>
+          </>
+        )}
+
+        {mode === "existingcode" && (
+          <>
+            <div style={{ fontSize: 13, color: p.muted, marginBottom: 10 }}>Paste the Sync Code you saved from your other device.</div>
+            <textarea placeholder="Paste Sync Code here..." value={codeInput} onChange={e => setCodeInput(e.target.value)} rows={3}
+              style={{ ...inputStyle, fontFamily: "monospace", fontSize: 11, resize: "none" }} />
+            {err && <div style={{ color: p.red, fontSize: 12, marginTop: 8 }}>{err}</div>}
+            <button style={{ ...btnPrimary, marginTop: 10, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={handleConnectExisting}>
+              {busy ? "Connecting..." : "Connect"}
+            </button>
+            <button style={btnGhost} onClick={() => { setMode("choose"); setErr(""); }}>← Back</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================== MAIN TRACKER ============================== */
+
+function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
+  const [logs, setLogs] = useState(initialLogs);
+  const [view, setView] = useState("log");
+  const [activeWeek, setActiveWeek] = useState(getSundayOfWeek(todayStr()));
+  const [showWeekPicker, setShowWeekPicker] = useState(false);
+  const [activeSkip, setActiveSkip] = useState(null);
+  const [weightInput, setWeightInput] = useState("");
+  const [noteInput, setNoteInput] = useState("");
+  const [syncStatus, setSyncStatus] = useState(initialSyncStatus || "idle"); // idle|pending|saving|saved|offline|error
+  const [showSettings, setShowSettings] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const nowDate = new Date();
+  const [heatmapYear, setHeatmapYear] = useState(nowDate.getFullYear());
+  const [heatmapMonth, setHeatmapMonth] = useState(nowDate.getMonth());
+  const [exHeatmapYear, setExHeatmapYear] = useState(nowDate.getFullYear());
+  const [exHeatmapMonth, setExHeatmapMonth] = useState(nowDate.getMonth());
+  const saveTimer = useRef(null);
+  const fileInputRef = useRef(null);
+
+  const wlog = logs[activeWeek] || {};
+  const sessions = wlog.sessions || {};
+  const skipReasons = wlog.skipReasons || {};
+  const shakes = wlog.shakes || {};
+  const sessionsDone = Object.values(sessions).filter(v => v === "done").length;
+  const isCurrentWeek = activeWeek === getSundayOfWeek(todayStr());
+
+  useEffect(() => { loadWeekData(logs, activeWeek); }, []); // eslint-disable-line
+
+  function loadWeekData(data, wk) {
+    const w = data[wk] || {};
+    setWeightInput(w.weight ? String(w.weight) : "");
+    setNoteInput(w.note || "");
+    setActiveSkip(null);
+  }
+
+  function persist(updatedLogs) {
+    setLogs(updatedLogs);
+    const payload = { updatedAt: new Date().toISOString(), logs: updatedLogs };
+    writeLocalCache(payload); // instant, synchronous — safe even if the app is killed right after this
+    setSyncStatus("pending");
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      setSyncStatus("saving");
+      try {
+        await updateGistPayload(auth.token, auth.gistId, payload);
+        setSyncStatus("saved");
+        setTimeout(() => setSyncStatus(s => (s === "saved" ? "idle" : s)), 1500);
+      } catch (e) {
+        setSyncStatus(e.message === "unauthorized" ? "unauthorized" : "offline");
+      }
+    }, 700);
+  }
+
+  function switchWeek(wk) {
+    setActiveWeek(wk);
+    setShowWeekPicker(false);
+    loadWeekData(logs, wk);
+  }
+
+  function toggleShake(type, dayIndex) {
+    const key = `${type}_${dayIndex}`;
+    persist({ ...logs, [activeWeek]: { ...wlog, shakes: { ...shakes, [key]: !shakes[key] } } });
+  }
+
+  function handleSession(id, done) {
+    if (done) {
+      const s = { ...sessions, [id]: sessions[id] === "done" ? null : "done" };
+      persist({ ...logs, [activeWeek]: { ...wlog, sessions: s } });
+      setActiveSkip(null);
+    } else {
+      setActiveSkip(activeSkip === id ? null : id);
+    }
+  }
+
+  function handleReason(id, reason) {
+    const s = { ...sessions, [id]: sessions[id] === "skipped" && skipReasons[id] === reason ? null : "skipped" };
+    const r = { ...skipReasons, [id]: reason };
+    persist({ ...logs, [activeWeek]: { ...wlog, sessions: s, skipReasons: r } });
+    setActiveSkip(null);
+  }
+
+  function saveWeight() {
+    const w = parseFloat(weightInput);
+    if (isNaN(w) || w < 40 || w > 200) return;
+    persist({ ...logs, [activeWeek]: { ...wlog, weight: w } });
+  }
+
+  function saveNote() {
+    persist({ ...logs, [activeWeek]: { ...wlog, note: noteInput } });
+  }
+
+  async function forceRefresh() {
+    setSyncStatus("saving");
+    try {
+      const cloud = await fetchGistPayload(auth.token, auth.gistId);
+      setLogs(cloud.logs || {});
+      writeLocalCache(cloud);
+      loadWeekData(cloud.logs || {}, activeWeek);
+      setSyncStatus("saved");
+      setTimeout(() => setSyncStatus("idle"), 1200);
+    } catch (e) {
+      setSyncStatus(e.message === "unauthorized" ? "unauthorized" : "offline");
+    }
+  }
+
+  function exportBackup() {
+    const blob = new Blob([JSON.stringify(logs, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `bulk-tracker-backup-${todayStr()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function importBackup(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        persist(parsed);
+        loadWeekData(parsed, activeWeek);
+      } catch (err) {
+        alert("That file doesn't look like a valid backup.");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  }
+
+  function getWeekShakeCount(wk, type) {
+    const s = (logs[wk] || {}).shakes || {};
+    return [0,1,2,3,4,5,6].filter(i => s[`${type}_${i}`]).length;
+  }
+  function getWeekMacros() {
+    return { morning: getWeekShakeCount(activeWeek, "morning"), night: getWeekShakeCount(activeWeek, "night") };
+  }
+  function getChartData() {
+    return getAllWeekKeys(logs).map(k => ({ week: fmtShort(k), weight: logs[k].weight }));
+  }
+  function getGainRate() {
+    const weeks = getAllWeekKeys(logs);
+    if (weeks.length < 2) return null;
+    return (logs[weeks[weeks.length-1]].weight - logs[weeks[weeks.length-2]].weight).toFixed(2);
+  }
+  function getStreak() {
+    const weeks = getAllWeekKeys(logs).reverse();
+    let streak = 0;
+    for (const wk of weeks) {
+      const done = Object.values((logs[wk].sessions || {})).filter(v => v === "done").length;
+      if (done === 4) streak++; else break;
+    }
+    return streak;
+  }
+
+  const chartData = getChartData();
+  const latestWeight = chartData.length > 0 ? chartData[chartData.length-1].weight : START_WEIGHT;
+  const progress = Math.min(100, Math.max(0, ((latestWeight - START_WEIGHT) / (TARGET_WEIGHT - START_WEIGHT)) * 100));
+  const gainRate = getGainRate();
+  const streak = getStreak();
+  const macros = getWeekMacros();
+  const past16Weeks = getPast16Weeks();
+
+  function gainColor() {
+    if (!gainRate) return p.muted;
+    const r = parseFloat(gainRate);
+    if (r >= 0.25 && r <= 0.6) return p.green;
+    if (r > 0.6) return p.amber;
+    return p.red;
+  }
+  function gainLabel() {
+    if (!gainRate) return "–";
+    const r = parseFloat(gainRate);
+    if (r >= 0.25 && r <= 0.6) return "On track";
+    if (r > 0.6) return "Too fast";
+    if (r > 0) return "Too slow — eat more";
+    return "Losing weight";
+  }
+
+  function syncBadge() {
+    const map = {
+      idle: null,
+      pending: { text: "Waiting to sync...", color: p.muted },
+      saving: { text: "Syncing...", color: p.blue },
+      saved: { text: "✓ Synced", color: p.green },
+      offline: { text: "⚠ Offline — saved locally, will retry", color: p.amber },
+      unauthorized: { text: "⚠ Reconnect needed (token invalid)", color: p.red },
+      error: { text: "⚠ Sync failed — saved locally", color: p.red },
+    };
+    const s = map[syncStatus];
+    if (!s) return null;
+    return <span style={{ fontSize: 10, color: s.color, fontWeight: 600 }}>{s.text}</span>;
+  }
+
+  const syncCode = makeSyncCode(auth.token, auth.gistId);
+
+  return (
+    <div style={{ minHeight: "100vh", background: p.bg, color: p.text, fontFamily: "'Inter', 'Helvetica Neue', sans-serif", fontSize: 14 }}>
+
+      {/* HEADER */}
+      <div style={{ background: p.white, borderBottom: `1px solid ${p.border}`, padding: "20px 20px 16px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
+          <div>
+            <div style={{ fontSize: 10, letterSpacing: 4, color: p.muted, marginBottom: 5, textTransform: "uppercase", fontWeight: 500 }}>Bulk Tracker</div>
+            <div style={{ fontSize: 30, fontWeight: 700, letterSpacing: -1, lineHeight: 1 }}>
+              {latestWeight.toFixed(1)}<span style={{ fontSize: 14, color: p.muted, fontWeight: 400 }}> kg</span>
+              <span style={{ color: p.dim, margin: "0 8px", fontWeight: 300 }}>→</span>
+              <span style={{ color: p.green }}>70 kg</span>
+            </div>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 5 }}>
+            <button onClick={() => setShowSettings(!showSettings)} style={{ background: "none", border: `1px solid ${p.border}`, borderRadius: 20, padding: "3px 10px", fontSize: 11, color: p.muted, cursor: "pointer" }}>⚙ Sync</button>
+            {streak > 0 && (
+              <span style={{ background: p.amberLight, border: `1px solid ${p.amberBorder}`, borderRadius: 20, padding: "3px 10px", fontSize: 11, color: p.amber, fontWeight: 600 }}>
+                🔥 {streak}w streak
+              </span>
+            )}
+            {gainRate && (
+              <span style={{ fontSize: 11, color: gainColor(), fontWeight: 600 }}>
+                {gainRate > 0 ? "+" : ""}{gainRate} kg/wk · {gainLabel()}
+              </span>
+            )}
+          </div>
+        </div>
+        <div style={{ height: 4, background: p.border, borderRadius: 2, overflow: "hidden" }}>
+          <div style={{ height: "100%", borderRadius: 2, background: p.green, width: `${progress}%`, transition: "width 0.5s" }} />
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 10, color: p.muted }}>
+          <span>60.5 kg</span>
+          <span>{syncBadge() || `${progress.toFixed(0)}% to goal`}</span>
+          <span>70 kg</span>
+        </div>
+      </div>
+
+      {/* SETTINGS PANEL */}
+      {showSettings && (
+        <div style={{ background: p.white, borderBottom: `1px solid ${p.border}`, padding: 16 }}>
+          <div style={{ maxWidth: 480, margin: "0 auto", display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ fontSize: 11, letterSpacing: 2, color: p.muted, textTransform: "uppercase", fontWeight: 600 }}>Sync & backup</div>
+            <div style={{ fontSize: 12, color: p.muted }}>Your Sync Code (paste this into the app on any other device):</div>
+            <textarea readOnly value={syncCode} rows={2} onClick={e => e.target.select()}
+              style={{ width: "100%", padding: "8px 10px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, fontSize: 10, fontFamily: "monospace", resize: "none" }} />
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => { navigator.clipboard?.writeText(syncCode).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }); }}
+                style={{ flex: 1, padding: "8px 10px", background: p.blue, border: "none", borderRadius: 8, color: "#fff", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                {copied ? "✓ Copied" : "Copy code"}
+              </button>
+              <button onClick={forceRefresh} style={{ flex: 1, padding: "8px 10px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 8, color: p.text, fontSize: 12, cursor: "pointer" }}>↻ Refresh</button>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={exportBackup} style={{ flex: 1, padding: "8px 10px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 8, color: p.text, fontSize: 12, cursor: "pointer" }}>⬇ Export .json</button>
+              <button onClick={() => fileInputRef.current?.click()} style={{ flex: 1, padding: "8px 10px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 8, color: p.text, fontSize: 12, cursor: "pointer" }}>⬆ Import .json</button>
+              <input ref={fileInputRef} type="file" accept="application/json" style={{ display: "none" }} onChange={importBackup} />
+            </div>
+            {(syncStatus === "unauthorized") && (
+              <div style={{ fontSize: 11, color: p.red }}>Your token isn't working anymore. Disconnect and set up again with a fresh token — your data is safe locally in the meantime.</div>
+            )}
+            <button onClick={() => { if (confirm("Disconnect this device? Your cloud data is untouched, but you'll need the Sync Code to reconnect.")) onDisconnect(); }}
+              style={{ padding: "8px 10px", background: p.redLight, border: `1px solid ${p.redBorder}`, borderRadius: 8, color: p.red, fontSize: 12, cursor: "pointer" }}>
+              Disconnect this device
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* NAV */}
+      <div style={{ display: "flex", background: p.white, borderBottom: `1px solid ${p.border}` }}>
+        {[["log","Log"],["chart","Chart"],["history","History"]].map(([id, label]) => (
+          <button key={id} onClick={() => setView(id)} style={{
+            flex: 1, padding: "11px 0", background: "none", border: "none",
+            color: view === id ? p.blue : p.muted, fontSize: 13,
+            fontWeight: view === id ? 600 : 400, cursor: "pointer", fontFamily: "inherit",
+            borderBottom: `2px solid ${view === id ? p.blue : "transparent"}`,
+          }}>{label}</button>
+        ))}
+      </div>
+
+      <div style={{ padding: "16px 16px 48px", maxWidth: 480, margin: "0 auto" }}>
+
+        {/* ══ LOG ══ */}
+        {view === "log" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+
+            <button onClick={() => setShowWeekPicker(!showWeekPicker)} style={{ width: "100%", padding: "11px 14px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 10, cursor: "pointer", fontFamily: "inherit", display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13, color: p.text }}>
+              <span style={{ fontWeight: 500 }}>{isCurrentWeek ? "This week" : `Week of ${fmtShort(activeWeek)}`}</span>
+              <span style={{ color: p.muted, fontSize: 11 }}>{showWeekPicker ? "▲ Close" : "▼ Change"}</span>
+            </button>
+
+            {showWeekPicker && (
+              <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 10, overflow: "hidden", maxHeight: 240, overflowY: "auto" }}>
+                {past16Weeks.slice().reverse().map(wk => (
+                  <button key={wk} onClick={() => switchWeek(wk)} style={{ width: "100%", padding: "11px 14px", background: wk === activeWeek ? p.blueLight : "none", border: "none", borderBottom: `1px solid ${p.border}`, cursor: "pointer", fontFamily: "inherit", textAlign: "left", fontSize: 13, color: wk === activeWeek ? p.blue : p.text, display: "flex", justifyContent: "space-between" }}>
+                    <span>{wk === getSundayOfWeek(todayStr()) ? "This week" : `Week of ${fmtShort(wk)}`}</span>
+                    {logs[wk]?.weight && <span style={{ fontSize: 11, color: p.green }}>{logs[wk].weight} kg</span>}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Shakes */}
+            <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, overflow: "hidden" }}>
+              <div style={{ padding: "12px 14px", borderBottom: `1px solid ${p.border}` }}>
+                <span style={{ fontSize: 11, letterSpacing: 3, color: p.muted, textTransform: "uppercase", fontWeight: 500 }}>Shakes</span>
+              </div>
+              <div style={{ padding: "12px 14px" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "52px repeat(7, 1fr)", gap: 4, marginBottom: 8 }}>
+                  <div />
+                  {DAY_LABELS.map(d => <div key={d} style={{ textAlign: "center", fontSize: 9, color: p.muted, fontWeight: 600 }}>{d}</div>)}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "52px repeat(7, 1fr)", gap: 4, marginBottom: 6, alignItems: "center" }}>
+                  <div style={{ fontSize: 11, color: p.muted }}>🌅 Morn</div>
+                  {[0,1,2,3,4,5,6].map(i => {
+                    const active = shakes[`morning_${i}`];
+                    return <button key={i} onClick={() => toggleShake("morning", i)} style={{ height: 28, borderRadius: 6, border: `1.5px solid ${active ? p.green : p.border}`, background: active ? p.green : p.bg, cursor: "pointer", transition: "all 0.12s" }} />;
+                  })}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "52px repeat(7, 1fr)", gap: 4, alignItems: "center" }}>
+                  <div style={{ fontSize: 11, color: p.muted }}>🌙 Night</div>
+                  {[0,1,2,3,4,5,6].map(i => {
+                    const active = shakes[`night_${i}`];
+                    return <button key={i} onClick={() => toggleShake("night", i)} style={{ height: 28, borderRadius: 6, border: `1.5px solid ${active ? p.blue : p.border}`, background: active ? p.blue : p.bg, cursor: "pointer", transition: "all 0.12s" }} />;
+                  })}
+                </div>
+              </div>
+              <div style={{ padding: "10px 14px", background: p.greenLight, borderTop: `1px solid ${p.greenBorder}`, display: "flex" }}>
+                {[
+                  { label: "🌅 Morning", count: macros.morning, color: p.green },
+                  { label: "🌙 Night", count: macros.night, color: p.blue },
+                  { label: "Overall", count: macros.morning + macros.night, color: p.text },
+                ].map((m, i) => {
+                  const total = i < 2 ? 7 : 14;
+                  const pct = Math.round((m.count / total) * 100);
+                  return (
+                    <div key={m.label} style={{ flex: 1, textAlign: "center" }}>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: m.color }}>{m.count}/{total}</div>
+                      <div style={{ fontSize: 9, color: p.muted, marginTop: 1 }}>{m.label}</div>
+                      <div style={{ fontSize: 10, color: m.color, fontWeight: 600 }}>{pct}%</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Training */}
+            <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, overflow: "hidden" }}>
+              <div style={{ padding: "12px 14px", borderBottom: `1px solid ${p.border}`, display: "flex", justifyContent: "space-between" }}>
+                <span style={{ fontSize: 11, letterSpacing: 3, color: p.muted, textTransform: "uppercase", fontWeight: 500 }}>Training</span>
+                <span style={{ fontSize: 11, color: sessionsDone === 4 ? p.green : p.muted, fontWeight: 600 }}>{sessionsDone}/4 done</span>
+              </div>
+              {SESSIONS.map((s, i) => {
+                const status = sessions[s.id];
+                const isSkipping = activeSkip === s.id;
+                return (
+                  <div key={s.id}>
+                    <div style={{ padding: "11px 14px", borderBottom: (i < 3 || isSkipping) ? `1px solid ${p.border}` : "none", background: status === "done" ? p.greenLight : status === "skipped" ? p.redLight : p.white, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <div>
+                        <div style={{ fontSize: 13 }}>{s.label}</div>
+                        {status === "skipped" && skipReasons[s.id] && <div style={{ fontSize: 10, color: p.red, marginTop: 2 }}>{SKIP_REASONS.find(r => r.id === skipReasons[s.id])?.label}</div>}
+                      </div>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button onClick={() => handleSession(s.id, true)} style={{ padding: "6px 11px", borderRadius: 7, fontSize: 11, cursor: "pointer", fontFamily: "inherit", background: status === "done" ? p.green : p.white, border: `1px solid ${status === "done" ? p.green : p.greenBorder}`, color: status === "done" ? "#fff" : p.green, fontWeight: 500 }}>✓ Done</button>
+                        <button onClick={() => handleSession(s.id, false)} style={{ padding: "6px 11px", borderRadius: 7, fontSize: 11, cursor: "pointer", fontFamily: "inherit", background: status === "skipped" ? p.red : p.white, border: `1px solid ${status === "skipped" ? p.red : p.redBorder}`, color: status === "skipped" ? "#fff" : p.red, fontWeight: 500 }}>✗ Skip</button>
+                      </div>
+                    </div>
+                    {isSkipping && (
+                      <div style={{ background: p.bg }}>
+                        <div style={{ padding: "6px 14px 2px", fontSize: 10, color: p.muted, letterSpacing: 2, textTransform: "uppercase" }}>Reason?</div>
+                        {SKIP_REASONS.map(r => <button key={r.id} onClick={() => handleReason(s.id, r.id)} style={{ width: "100%", padding: "10px 14px", background: "none", border: "none", borderBottom: `1px solid ${p.border}`, cursor: "pointer", fontFamily: "inherit", textAlign: "left", fontSize: 12, color: p.text }}>{r.label}</button>)}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Weight */}
+            <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, overflow: "hidden" }}>
+              <div style={{ padding: "12px 14px", borderBottom: `1px solid ${p.border}` }}>
+                <span style={{ fontSize: 11, letterSpacing: 3, color: p.muted, textTransform: "uppercase", fontWeight: 500 }}>Weekly Weight</span>
+              </div>
+              <div style={{ padding: "12px 14px" }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <input type="number" step="0.1" min="50" max="150" placeholder="61.5" value={weightInput} onChange={e => setWeightInput(e.target.value)}
+                    style={{ flex: 1, padding: "10px 12px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, color: p.text, fontSize: 18, fontFamily: "inherit", outline: "none" }} />
+                  <span style={{ color: p.muted, fontSize: 12 }}>kg</span>
+                  <button onClick={saveWeight} style={{ padding: "10px 16px", background: p.blue, border: "none", borderRadius: 8, color: "#fff", fontWeight: 600, fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>Save</button>
+                </div>
+                {wlog.weight && <div style={{ fontSize: 11, color: p.green, marginTop: 7 }}>✓ {wlog.weight} kg saved this week</div>}
+              </div>
+            </div>
+
+            {/* Note */}
+            <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, overflow: "hidden" }}>
+              <div style={{ padding: "12px 14px", borderBottom: `1px solid ${p.border}` }}>
+                <span style={{ fontSize: 11, letterSpacing: 3, color: p.muted, textTransform: "uppercase", fontWeight: 500 }}>Note — optional</span>
+              </div>
+              <div style={{ padding: "12px 14px" }}>
+                <textarea placeholder="Travel week, felt strong, poor sleep..." value={noteInput} onChange={e => setNoteInput(e.target.value)} onBlur={saveNote} rows={2}
+                  style={{ width: "100%", padding: "9px 12px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, color: p.text, fontSize: 13, fontFamily: "inherit", outline: "none", resize: "none", boxSizing: "border-box" }} />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ══ CHART ══ */}
+        {view === "chart" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <div style={{ display: "flex", gap: 10 }}>
+              {[
+                { label: "Current", val: `${latestWeight.toFixed(1)} kg`, color: p.text },
+                { label: "Gained", val: `+${(latestWeight - START_WEIGHT).toFixed(1)} kg`, color: p.green },
+                { label: "To go", val: `${Math.max(0, TARGET_WEIGHT - latestWeight).toFixed(1)} kg`, color: p.blue },
+              ].map(s => (
+                <div key={s.label} style={{ flex: 1, padding: "12px 8px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 10, textAlign: "center" }}>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: s.color }}>{s.val}</div>
+                  <div style={{ fontSize: 9, color: p.muted, marginTop: 3, textTransform: "uppercase", letterSpacing: 1 }}>{s.label}</div>
+                </div>
+              ))}
+            </div>
+
+            {gainRate && (
+              <div style={{ padding: "12px 14px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontSize: 10, letterSpacing: 2, color: p.muted, textTransform: "uppercase", marginBottom: 3 }}>Weekly gain rate</div>
+                  <div style={{ fontSize: 13, color: gainColor(), fontWeight: 600 }}>{gainLabel()} — target 0.25–0.5 kg/wk</div>
+                </div>
+                <div style={{ fontSize: 22, fontWeight: 700, color: gainColor() }}>{gainRate > 0 ? "+" : ""}{gainRate}</div>
+              </div>
+            )}
+
+            <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, padding: "14px 8px 8px" }}>
+              <div style={{ fontSize: 10, letterSpacing: 2, color: p.muted, textTransform: "uppercase", padding: "0 8px", marginBottom: 10 }}>Weight (kg)</div>
+              <WeightChart data={chartData} target={TARGET_WEIGHT} />
+            </div>
+
+            {/* Shake Heatmap */}
+            <div style={{ fontSize: 11, letterSpacing: 3, color: p.muted, textTransform: "uppercase", fontWeight: 500 }}>Shake Consistency</div>
+            {(() => {
+              const startYear = 2026, startMonth = 6;
+              const nowD = new Date();
+              const canGoBack = heatmapYear > startYear || (heatmapYear === startYear && heatmapMonth > startMonth);
+              const canGoForward = heatmapYear < nowD.getFullYear() || (heatmapYear === nowD.getFullYear() && heatmapMonth < nowD.getMonth());
+              function prevM() { if (!canGoBack) return; if (heatmapMonth === 0) { setHeatmapYear(y=>y-1); setHeatmapMonth(11); } else setHeatmapMonth(m=>m-1); }
+              function nextM() { if (!canGoForward) return; if (heatmapMonth === 11) { setHeatmapYear(y=>y+1); setHeatmapMonth(0); } else setHeatmapMonth(m=>m+1); }
+              const days = getDaysInMonth(heatmapYear, heatmapMonth);
+              let morningCount = 0, nightCount = 0;
+              const dayData = days.map(dateStr => {
+                const dow = new Date(dateStr + "T00:00:00").getDay();
+                const wk = getSundayOfWeek(dateStr);
+                const s = getShakeStatus(logs, wk, dow);
+                if (s.morning) morningCount++;
+                if (s.night) nightCount++;
+                return { dateStr, morning: s.morning, night: s.night, future: dateStr > todayStr() };
+              });
+              const firstDow = new Date(dayData[0].dateStr + "T00:00:00").getDay();
+              const cells = [...Array(firstDow).fill(null), ...dayData];
+              const weeks = [];
+              for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i+7));
+              return (
+                <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, overflow: "hidden" }}>
+                  <div style={{ padding: "12px 14px", borderBottom: `1px solid ${p.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <button onClick={prevM} disabled={!canGoBack} style={{ background: "none", border: "none", cursor: canGoBack ? "pointer" : "default", color: canGoBack ? p.text : p.dim, fontSize: 18, padding: "0 4px" }}>‹</button>
+                    <div style={{ textAlign: "center" }}>
+                      <div style={{ fontSize: 13, fontWeight: 600 }}>{MONTH_NAMES[heatmapMonth]} {heatmapYear}</div>
+                      <div style={{ display: "flex", gap: 10, fontSize: 10, color: p.muted, marginTop: 2, justifyContent: "center" }}>
+                        <span><span style={{ display: "inline-block", width: 8, height: 8, background: p.green, borderRadius: 2, marginRight: 3 }} />Morning</span>
+                        <span><span style={{ display: "inline-block", width: 8, height: 8, background: p.blue, borderRadius: 2, marginRight: 3 }} />Night</span>
+                      </div>
+                    </div>
+                    <button onClick={nextM} disabled={!canGoForward} style={{ background: "none", border: "none", cursor: canGoForward ? "pointer" : "default", color: canGoForward ? p.text : p.dim, fontSize: 18, padding: "0 4px" }}>›</button>
+                  </div>
+                  <div style={{ padding: "12px 14px" }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, marginBottom: 6 }}>
+                      {DAY_LABELS.map(d => <div key={d} style={{ textAlign: "center", fontSize: 9, color: p.muted, fontWeight: 600 }}>{d}</div>)}
+                    </div>
+                    <div style={{ fontSize: 10, color: p.muted, marginBottom: 4 }}>🌅 Morning</div>
+                    {weeks.map((week, wi) => (
+                      <div key={`m-${wi}`} style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, marginBottom: 2 }}>
+                        {[...week, ...Array(7-week.length).fill(null)].map((cell, ci) => (
+                          <div key={ci} style={{ height: 14, borderRadius: 3, background: !cell ? "transparent" : cell.future ? p.border : cell.morning ? p.green : p.border, opacity: !cell ? 0 : cell.future ? 0.2 : cell.morning ? 1 : 0.3 }} />
+                        ))}
+                      </div>
+                    ))}
+                    <div style={{ fontSize: 10, color: p.muted, margin: "8px 0 4px" }}>🌙 Night</div>
+                    {weeks.map((week, wi) => (
+                      <div key={`n-${wi}`} style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, marginBottom: 2 }}>
+                        {[...week, ...Array(7-week.length).fill(null)].map((cell, ci) => (
+                          <div key={ci} style={{ height: 14, borderRadius: 3, background: !cell ? "transparent" : cell.future ? p.border : cell.night ? p.blue : p.border, opacity: !cell ? 0 : cell.future ? 0.2 : cell.night ? 1 : 0.3 }} />
+                        ))}
+                      </div>
+                    ))}
+                    <div style={{ marginTop: 12, padding: "10px 12px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                      <span>🌅 <strong style={{ color: p.green }}>{morningCount}</strong><span style={{ color: p.muted }}>/{days.length}</span></span>
+                      <span>🌙 <strong style={{ color: p.blue }}>{nightCount}</strong><span style={{ color: p.muted }}>/{days.length}</span></span>
+                      <span style={{ color: p.muted }}>{Math.round(((morningCount+nightCount)/(days.length*2))*100)}% overall</span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Training Heatmap */}
+            <div style={{ fontSize: 11, letterSpacing: 3, color: p.muted, textTransform: "uppercase", fontWeight: 500 }}>Training Consistency</div>
+            {(() => {
+              const startYear = 2026, startMonth = 6;
+              const nowD = new Date();
+              const canGoBack = exHeatmapYear > startYear || (exHeatmapYear === startYear && exHeatmapMonth > startMonth);
+              const canGoForward = exHeatmapYear < nowD.getFullYear() || (exHeatmapYear === nowD.getFullYear() && exHeatmapMonth < nowD.getMonth());
+              function prevM() { if (!canGoBack) return; if (exHeatmapMonth === 0) { setExHeatmapYear(y=>y-1); setExHeatmapMonth(11); } else setExHeatmapMonth(m=>m-1); }
+              function nextM() { if (!canGoForward) return; if (exHeatmapMonth === 11) { setExHeatmapYear(y=>y+1); setExHeatmapMonth(0); } else setExHeatmapMonth(m=>m+1); }
+              const days = getDaysInMonth(exHeatmapYear, exHeatmapMonth);
+              const weeksInMonth = [...new Set(days.map(d => getSundayOfWeek(d)))];
+              const totalSessions = weeksInMonth.length * 4;
+              let doneSessions = 0, skippedSessions = 0;
+              const weekRows = weeksInMonth.map(wk => {
+                const s = (logs[wk] || {}).sessions || {};
+                const startOfWeek = new Date(wk + "T00:00:00");
+                const weekLabel = `${startOfWeek.getDate()} ${MONTH_NAMES[startOfWeek.getMonth()]}`;
+                const sessionData = SESSIONS.map(sess => {
+                  const status = s[sess.id];
+                  if (status === "done") doneSessions++;
+                  if (status === "skipped") skippedSessions++;
+                  return { id: sess.id, label: sess.label, status };
+                });
+                return { wk, weekLabel, sessionData, isFuture: wk > getSundayOfWeek(todayStr()) };
+              });
+              return (
+                <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, overflow: "hidden" }}>
+                  <div style={{ padding: "12px 14px", borderBottom: `1px solid ${p.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <button onClick={prevM} disabled={!canGoBack} style={{ background: "none", border: "none", cursor: canGoBack ? "pointer" : "default", color: canGoBack ? p.text : p.dim, fontSize: 18, padding: "0 4px" }}>‹</button>
+                    <div style={{ textAlign: "center" }}>
+                      <div style={{ fontSize: 13, fontWeight: 600 }}>{MONTH_NAMES[exHeatmapMonth]} {exHeatmapYear}</div>
+                      <div style={{ display: "flex", gap: 10, fontSize: 10, color: p.muted, marginTop: 2, justifyContent: "center" }}>
+                        <span><span style={{ display: "inline-block", width: 8, height: 8, background: p.green, borderRadius: 2, marginRight: 3 }} />Done</span>
+                        <span><span style={{ display: "inline-block", width: 8, height: 8, background: p.red, borderRadius: 2, marginRight: 3 }} />Skipped</span>
+                        <span><span style={{ display: "inline-block", width: 8, height: 8, background: p.border, borderRadius: 2, marginRight: 3 }} />Not logged</span>
+                      </div>
+                    </div>
+                    <button onClick={nextM} disabled={!canGoForward} style={{ background: "none", border: "none", cursor: canGoForward ? "pointer" : "default", color: canGoForward ? p.text : p.dim, fontSize: 18, padding: "0 4px" }}>›</button>
+                  </div>
+                  <div style={{ padding: "12px 14px" }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "52px repeat(4, 1fr)", gap: 4, marginBottom: 8 }}>
+                      <div />
+                      {SESSIONS.map(s => <div key={s.id} style={{ textAlign: "center", fontSize: 8, color: p.muted, fontWeight: 600 }}>{s.label}</div>)}
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      {weekRows.map(({ wk, weekLabel, sessionData, isFuture }) => (
+                        <div key={wk} style={{ display: "grid", gridTemplateColumns: "52px repeat(4, 1fr)", gap: 4, alignItems: "center" }}>
+                          <div style={{ fontSize: 9, color: p.muted }}>{weekLabel}</div>
+                          {sessionData.map(sess => (
+                            <div key={sess.id} style={{ height: 28, borderRadius: 6, background: isFuture ? p.border : sess.status === "done" ? p.green : sess.status === "skipped" ? p.red : p.border, opacity: isFuture ? 0.2 : sess.status ? 1 : 0.35 }} />
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ marginTop: 12, padding: "10px 12px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                      <span>💪 <strong style={{ color: p.green }}>{doneSessions}</strong><span style={{ color: p.muted }}>/{totalSessions} done</span></span>
+                      <span>❌ <strong style={{ color: p.red }}>{skippedSessions}</strong><span style={{ color: p.muted }}> skipped</span></span>
+                      <span style={{ color: p.muted }}>{totalSessions > 0 ? Math.round((doneSessions/totalSessions)*100) : 0}%</span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* ══ HISTORY ══ */}
+        {view === "history" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {getAllWeekKeys(logs).length === 0 ? (
+              <div style={{ textAlign: "center", color: p.dim, padding: "60px 0", fontSize: 13 }}>No history yet — start logging!</div>
+            ) : (
+              getAllWeekKeys(logs).slice().reverse().map(wk => {
+                const wl = logs[wk] || {};
+                const done = Object.values(wl.sessions || {}).filter(v => v === "done").length;
+                const ms = getWeekShakeCount(wk, "morning");
+                const ns = getWeekShakeCount(wk, "night");
+                const isGood = done >= 3, isBad = done <= 1;
+                return (
+                  <div key={wk} style={{ background: p.white, border: `1px solid ${isGood ? p.greenBorder : isBad ? p.redBorder : p.border}`, borderRadius: 12, overflow: "hidden" }}>
+                    <div style={{ padding: "11px 14px", background: isGood ? p.greenLight : isBad ? p.redLight : p.white, borderBottom: `1px solid ${p.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ fontSize: 11, color: p.muted, textTransform: "uppercase", letterSpacing: 1 }}>Week of {fmtShort(wk)}</span>
+                      <span style={{ fontSize: 18, fontWeight: 700, color: isGood ? p.green : isBad ? p.red : p.text }}>{wl.weight} kg</span>
+                    </div>
+                    <div style={{ padding: "9px 14px", display: "flex", gap: 14, fontSize: 11, color: p.muted, flexWrap: "wrap" }}>
+                      <span>💪 {done}/4</span>
+                      <span>🌅 {ms}/7</span>
+                      <span>🌙 {ns}/7</span>
+                      {wl.note && <span style={{ color: p.text }}>📝 {wl.note}</span>}
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================== APP ROOT (boot / reconcile) ============================== */
+
+function App() {
+  const [phase, setPhase] = useState("boot"); // boot|onboarding|ready
+  const [auth, setAuth] = useState(null);
+  const [initialLogs, setInitialLogs] = useState({});
+  const [initialSyncStatus, setInitialSyncStatus] = useState("idle");
+  const [bootError, setBootError] = useState("");
+
+  useEffect(() => { boot(); }, []); // eslint-disable-line
+
+  async function boot() {
+    const savedAuth = readLocalAuth();
+    if (!savedAuth) { setPhase("onboarding"); return; }
+    const localCache = readLocalCache();
+    try {
+      const cloud = await fetchGistPayload(savedAuth.token, savedAuth.gistId);
+      let winner = cloud;
+      let needsPush = false;
+      if (localCache && localCache.updatedAt && (!cloud.updatedAt || new Date(localCache.updatedAt) > new Date(cloud.updatedAt))) {
+        winner = localCache;
+        needsPush = true;
+      }
+      setAuth(savedAuth);
+      setInitialLogs(winner.logs || {});
+      writeLocalCache(winner);
+      if (needsPush) {
+        updateGistPayload(savedAuth.token, savedAuth.gistId, winner).catch(() => {});
+      }
+      setInitialSyncStatus("saved");
+      setPhase("ready");
+    } catch (e) {
+      if (e.message === "unauthorized") {
+        if (localCache) {
+          setAuth(savedAuth);
+          setInitialLogs(localCache.logs || {});
+          setInitialSyncStatus("unauthorized");
+          setPhase("ready");
+        } else {
+          setBootError("Your saved token no longer works. Reconnect to continue.");
+          setPhase("onboarding");
+        }
+      } else {
+        // offline / network issue — fall back to local cache if we have it
+        if (localCache) {
+          setAuth(savedAuth);
+          setInitialLogs(localCache.logs || {});
+          setInitialSyncStatus("offline");
+          setPhase("ready");
+        } else {
+          setBootError("Couldn't reach the cloud and there's no local backup yet. Check your connection and reload.");
+          setPhase("onboarding");
+        }
+      }
+    }
+  }
+
+  function handleOnboardReady(newAuth) {
+    (async () => {
+      try {
+        const cloud = await fetchGistPayload(newAuth.token, newAuth.gistId);
+        setAuth(newAuth);
+        setInitialLogs(cloud.logs || {});
+        writeLocalCache(cloud);
+        setInitialSyncStatus("saved");
+        setPhase("ready");
+      } catch (e) {
+        setAuth(newAuth);
+        setInitialLogs({});
+        setInitialSyncStatus("offline");
+        setPhase("ready");
+      }
+    })();
+  }
+
+  function handleDisconnect() {
+    clearLocalAuth();
+    setAuth(null);
+    setInitialLogs({});
+    setPhase("onboarding");
+  }
+
+  if (phase === "boot") {
+    return <div style={{ minHeight: "100vh", background: p.bg, display: "flex", alignItems: "center", justifyContent: "center", color: p.muted, fontFamily: "sans-serif", fontSize: 13 }}>Loading your tracker...</div>;
+  }
+  if (phase === "onboarding") {
+    return (
+      <>
+        {bootError && <div style={{ background: p.redLight, color: p.red, textAlign: "center", padding: 10, fontSize: 12 }}>{bootError}</div>}
+        <Onboarding onReady={handleOnboardReady} />
+      </>
+    );
+  }
+  return <Tracker auth={auth} initialLogs={initialLogs} initialSyncStatus={initialSyncStatus} onDisconnect={handleDisconnect} />;
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
