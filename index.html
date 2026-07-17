@@ -876,6 +876,7 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
                         opacity: isFuture ? 0.35 : 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
                       }}>
                         <span style={{ fontSize: 9, color: p.muted, fontWeight: 600 }}>{d}</span>
+                        <span style={{ fontSize: 8, color: p.dim, fontWeight: 500 }}>{fmtShort(cellDate)}</span>
                         <span style={{ fontSize: 10, color: val != null ? p.green : p.dim, fontWeight: 600 }}>{val != null ? val : "–"}</span>
                         {isToday && <span style={{ position: "absolute", top: 3, right: 3, width: 4, height: 4, borderRadius: "50%", background: p.blue }} />}
                       </button>
