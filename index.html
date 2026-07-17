@@ -77,6 +77,9 @@ function getSundayOfWeek(dateStr) {
   return toDateStr(d);
 }
 function todayStr() { return toDateStr(new Date()); }
+function dayName(dateStr) {
+  return DAY_LABELS[new Date(dateStr + "T00:00:00").getDay()];
+}
 function fmtShort(dateStr) {
   return new Date(dateStr + "T00:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short" });
 }
@@ -439,6 +442,7 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
   const wlog = logs[activeWeek] || {};
   const sessions = wlog.sessions || {};
   const skipReasons = wlog.skipReasons || {};
+  const sessionDates = wlog.sessionDates || {};
   const shakes = wlog.shakes || {};
   const dailyWeights = wlog.dailyWeights || {};
   const sessionsDone = Object.values(sessions).filter(v => v === "done").length;
@@ -511,8 +515,11 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
 
   function handleSession(id, done) {
     if (done) {
-      const s = { ...sessions, [id]: sessions[id] === "done" ? null : "done" };
-      persist({ ...logs, [activeWeek]: { ...wlog, sessions: s } });
+      const nowDone = sessions[id] !== "done";
+      const s = { ...sessions, [id]: nowDone ? "done" : null };
+      const d = { ...sessionDates };
+      if (nowDone) d[id] = todayStr(); else delete d[id];
+      persist({ ...logs, [activeWeek]: { ...wlog, sessions: s, sessionDates: d } });
       setActiveSkip(null);
     } else {
       setActiveSkip(activeSkip === id ? null : id);
@@ -522,7 +529,9 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
   function handleReason(id, reason) {
     const s = { ...sessions, [id]: sessions[id] === "skipped" && skipReasons[id] === reason ? null : "skipped" };
     const r = { ...skipReasons, [id]: reason };
-    persist({ ...logs, [activeWeek]: { ...wlog, sessions: s, skipReasons: r } });
+    const d = { ...sessionDates };
+    delete d[id]; // skipped sessions aren't "done", so no completion date
+    persist({ ...logs, [activeWeek]: { ...wlog, sessions: s, skipReasons: r, sessionDates: d } });
     setActiveSkip(null);
   }
 
@@ -841,6 +850,7 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
                       <div>
                         <div style={{ fontSize: 13 }}>{s.label}</div>
                         {status === "skipped" && skipReasons[s.id] && <div style={{ fontSize: 10, color: p.red, marginTop: 2 }}>{SKIP_REASONS.find(r => r.id === skipReasons[s.id])?.label}</div>}
+                        {status === "done" && sessionDates[s.id] && <div style={{ fontSize: 10, color: p.dim, marginTop: 2 }}>{dayName(sessionDates[s.id])}</div>}
                       </div>
                       <div style={{ display: "flex", gap: 6 }}>
                         <button onClick={() => handleSession(s.id, true)} style={{ padding: "6px 11px", borderRadius: 7, fontSize: 11, cursor: "pointer", fontFamily: "inherit", background: status === "done" ? p.green : p.white, border: `1px solid ${status === "done" ? p.green : p.greenBorder}`, color: status === "done" ? "#fff" : p.green, fontWeight: 500 }}>✓ Done</button>
