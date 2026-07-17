@@ -140,6 +140,28 @@ function getAllLoggedWeekKeys(logs, startDate) {
     return hasWeight || hasSessions || hasShakes || hasNote;
   }).sort();
 }
+// Percentage breakdown of completed ("done") training sessions by day of week.
+// Only counts sessions that have a recorded completion date (sessionDates) —
+// done-toggles from before that feature existed have no date to bucket by.
+function getWorkoutDayBreakdown(logs, startDate) {
+  const cutoff = startDate || START_DATE;
+  const counts = [0, 0, 0, 0, 0, 0, 0];
+  let total = 0;
+  Object.keys(logs).forEach(wk => {
+    if (wk < cutoff) return;
+    const wl = logs[wk] || {};
+    const sessions = wl.sessions || {};
+    const dates = wl.sessionDates || {};
+    Object.keys(sessions).forEach(id => {
+      if (sessions[id] === "done" && dates[id]) {
+        const dow = new Date(dates[id] + "T00:00:00").getDay();
+        counts[dow]++;
+        total++;
+      }
+    });
+  });
+  return DAY_LABELS.map((label, i) => ({ label, count: counts[i], pct: total ? Math.round((counts[i] / total) * 100) : 0 }));
+}
 function getPast16Weeks() {
   const result = new Set();
   const d = new Date(todayStr() + "T00:00:00");
@@ -857,7 +879,7 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
                         <div style={{ fontSize: 13 }}>{s.label}</div>
                         {status === "skipped" && skipReasons[s.id] && <div style={{ fontSize: 10, color: p.red, marginTop: 2 }}>{SKIP_REASONS.find(r => r.id === skipReasons[s.id])?.label}</div>}
                         {status === "done" && sessionDates[s.id] && (
-                          <div onClick={() => setActiveDatePicker(activeDatePicker === s.id ? null : s.id)} style={{ fontSize: 10, color: p.dim, marginTop: 2, cursor: "pointer", textDecoration: "underline", textDecorationStyle: "dotted", width: "fit-content" }}>
+                          <div onClick={() => setActiveDatePicker(activeDatePicker === s.id ? null : s.id)} style={{ fontSize: 10, color: p.blue, fontWeight: 600, marginTop: 2, cursor: "pointer", textDecoration: "underline", textDecorationStyle: "dotted", width: "fit-content" }}>
                             {dayName(sessionDates[s.id])}
                           </div>
                         )}
@@ -1105,6 +1127,36 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
                 </div>
               );
             })()}
+
+            {/* Workout Day Breakdown */}
+            <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, overflow: "hidden" }}>
+              <div style={{ padding: "12px 14px", borderBottom: `1px solid ${p.border}` }}>
+                <span style={{ fontSize: 11, letterSpacing: 3, color: p.muted, textTransform: "uppercase", fontWeight: 500 }}>Workout Days</span>
+              </div>
+              <div style={{ padding: "12px 14px" }}>
+                {(() => {
+                  const breakdown = getWorkoutDayBreakdown(logs, goals.startDate);
+                  const totalDone = breakdown.reduce((a, b) => a + b.count, 0);
+                  if (!totalDone) {
+                    return <div style={{ textAlign: "center", color: p.dim, padding: "16px 0", fontSize: 12 }}>No completed sessions with a recorded day yet.</div>;
+                  }
+                  const maxPct = Math.max(...breakdown.map(d => d.pct), 1);
+                  return (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                      {breakdown.map(d => (
+                        <div key={d.label} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <div style={{ width: 30, fontSize: 11, color: p.muted, fontWeight: 600 }}>{d.label}</div>
+                          <div style={{ flex: 1, height: 14, background: p.bg, borderRadius: 7, overflow: "hidden" }}>
+                            <div style={{ width: `${(d.pct / maxPct) * 100}%`, height: "100%", background: p.blue, borderRadius: 7 }} />
+                          </div>
+                          <div style={{ width: 34, textAlign: "right", fontSize: 11, color: p.text, fontWeight: 600 }}>{d.pct}%</div>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
+              </div>
+            </div>
           </div>
         )}
 
