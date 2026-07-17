@@ -30,7 +30,7 @@ const LS_CACHE = "bulkTrackerCache_v1";
 
 const START_WEIGHT = 60.5;
 const TARGET_WEIGHT = 70;
-const START_DATE = "2026-07-11";
+const START_DATE = "2026-07-05";
 const SHAKE_MACROS = { kcal: 955, protein: 58, carbs: 77, fat: 50 };
 const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
@@ -255,7 +255,7 @@ function WeightChart({ data, target }) {
     return <div style={{ textAlign: "center", color: p.dim, padding: "40px 0", fontSize: 13 }}>No data yet.</div>;
   }
   const width = 400, height = 220;
-  const pad = { top: 14, right: 18, bottom: 24, left: 30 };
+  const pad = { top: 14, right: 18, bottom: 24, left: 34 };
   const weights = data.map(d => d.weight);
   const minY = Math.min(59, Math.min(...weights) - 1);
   const maxY = Math.max(71, Math.max(...weights) + 1, target + 1);
@@ -272,6 +272,9 @@ function WeightChart({ data, target }) {
     <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height: "auto", display: "block" }}>
       {gridVals.map((gy, i) => (
         <line key={i} x1={pad.left} x2={width - pad.right} y1={yPos(gy)} y2={yPos(gy)} stroke={p.border} strokeDasharray="2 5" />
+      ))}
+      {gridVals.map((gy, i) => (
+        <text key={"yl" + i} x={pad.left - 5} y={yPos(gy) + 3} textAnchor="end" fontSize="8" fill={p.dim}>{gy.toFixed(1)}</text>
       ))}
       <line x1={pad.left} x2={width - pad.right} y1={yPos(target)} y2={yPos(target)} stroke={p.green} strokeDasharray="5 3" strokeOpacity="0.6" />
       <text x={width - pad.right} y={yPos(target) - 4} textAnchor="end" fontSize="9" fill={p.green}>{target} kg</text>
@@ -627,7 +630,7 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
   const gainRate = getGainRate();
   const streak = getStreak();
   const macros = getWeekMacros();
-  const past16Weeks = getPast16Weeks();
+  const past16Weeks = getPast16Weeks().filter(wk => wk >= goals.startDate);
 
   function gainColor() {
     if (!gainRate) return p.muted;
