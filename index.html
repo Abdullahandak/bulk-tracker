@@ -84,10 +84,11 @@ function getWeekWeightAvg(logs, wk) {
   if (typeof wl.weight === "number") return wl.weight; // legacy fallback (pre-daily-log data)
   return null;
 }
-function getAllDailyEntries(logs) {
+function getAllDailyEntries(logs, startDate) {
+  const cutoff = startDate || START_DATE;
   const entries = [];
   Object.keys(logs).forEach(wk => {
-    if (wk < START_DATE) return;
+    if (wk < cutoff) return;
     const wl = logs[wk] || {};
     const dw = wl.dailyWeights || {};
     const keys = Object.keys(dw);
@@ -103,8 +104,29 @@ function getAllDailyEntries(logs) {
   });
   return entries.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 }
-function getAllWeekKeys(logs) {
-  return Object.keys(logs).filter(k => k >= START_DATE && getWeekWeightAvg(logs, k) !== null).sort();
+function getRollingCurrentWeight(logs, startDate) {
+  const entries = getAllDailyEntries(logs, startDate);
+  if (!entries.length) return null;
+  const todayD = new Date(todayStr() + "T00:00:00");
+  const windowStart = new Date(todayD); windowStart.setDate(windowStart.getDate() - 6);
+  const recent = entries.filter(e => { const d = new Date(e.date + "T00:00:00"); return d >= windowStart && d <= todayD; });
+  const pool = recent.length ? recent : [entries[entries.length - 1]];
+  return pool.reduce((a, b) => a + b.weight, 0) / pool.length;
+}
+// Weeks with ANY logged activity (weight, training, shakes, or a note) — used for
+// History and the training streak, so a week you trained but skipped weighing
+// in still shows up and still counts.
+function getAllLoggedWeekKeys(logs, startDate) {
+  const cutoff = startDate || START_DATE;
+  return Object.keys(logs).filter(k => {
+    if (k < cutoff) return false;
+    const wl = logs[k] || {};
+    const hasWeight = getWeekWeightAvg(logs, k) !== null;
+    const hasSessions = wl.sessions && Object.values(wl.sessions).some(v => v === "done" || v === "skipped");
+    const hasShakes = wl.shakes && Object.values(wl.shakes).some(Boolean);
+    const hasNote = !!wl.note;
+    return hasWeight || hasSessions || hasShakes || hasNote;
+  }).sort();
 }
 function getPast16Weeks() {
   const result = new Set();
@@ -269,7 +291,7 @@ function Onboarding({ onReady }) {
     setBusy(true); setErr("");
     try {
       const token = tokenInput.trim();
-      const initialPayload = { updatedAt: new Date().toISOString(), logs: {} };
+      const initialPayload = { updatedAt: new Date().toISOString(), logs: {}, goals: { startWeight: START_WEIGHT, targetWeight: TARGET_WEIGHT, startDate: START_DATE } };
       const gistId = await createGist(token, initialPayload);
       const auth = { token, gistId };
       writeLocalAuth(auth);
@@ -380,8 +402,10 @@ function Onboarding({ onReady }) {
 
 /* ============================== MAIN TRACKER ============================== */
 
-function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
+function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconnect }) {
   const [logs, setLogs] = useState(initialLogs);
+  const [goals, setGoals] = useState(initialGoals || { startWeight: START_WEIGHT, targetWeight: TARGET_WEIGHT, startDate: START_DATE });
+  const [goalInputs, setGoalInputs] = useState({ startWeight: String((initialGoals || {}).startWeight ?? START_WEIGHT), targetWeight: String((initialGoals || {}).targetWeight ?? TARGET_WEIGHT) });
   const [view, setView] = useState("log");
   const [activeWeek, setActiveWeek] = useState(getSundayOfWeek(todayStr()));
   const [showWeekPicker, setShowWeekPicker] = useState(false);
@@ -435,9 +459,11 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
     setWeightInput(existing != null ? String(existing) : "");
   }
 
-  function persist(updatedLogs) {
+  function persist(updatedLogs, updatedGoals) {
+    const g = updatedGoals || goals;
     setLogs(updatedLogs);
-    const payload = { updatedAt: new Date().toISOString(), logs: updatedLogs };
+    if (updatedGoals) setGoals(updatedGoals);
+    const payload = { updatedAt: new Date().toISOString(), logs: updatedLogs, goals: g };
     writeLocalCache(payload); // instant, synchronous — safe even if the app is killed right after this
     setSyncStatus("pending");
     if (saveTimer.current) clearTimeout(saveTimer.current);
@@ -451,6 +477,13 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
         setSyncStatus(e.message === "unauthorized" ? "unauthorized" : "offline");
       }
     }, 700);
+  }
+
+  function saveGoals() {
+    const sw = parseFloat(goalInputs.startWeight);
+    const tw = parseFloat(goalInputs.targetWeight);
+    if (isNaN(sw) || isNaN(tw) || sw < 30 || sw > 250 || tw < 30 || tw > 250) return;
+    persist(logs, { ...goals, startWeight: sw, targetWeight: tw });
   }
 
   function switchWeek(wk) {
@@ -487,6 +520,14 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
     const updatedWeekLog = { ...wlog, dailyWeights: { ...dailyWeights, [activeWeightDay]: w } };
     delete updatedWeekLog.weight; // migrate off the old single-weekly-value field
     persist({ ...logs, [activeWeek]: updatedWeekLog });
+  }
+
+  function clearWeight() {
+    if (dailyWeights[activeWeightDay] == null) return;
+    const newDaily = { ...dailyWeights };
+    delete newDaily[activeWeightDay];
+    persist({ ...logs, [activeWeek]: { ...wlog, dailyWeights: newDaily } });
+    setWeightInput("");
   }
 
   function saveNote() {
@@ -544,10 +585,10 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
     return { morning: getWeekShakeCount(activeWeek, "morning"), night: getWeekShakeCount(activeWeek, "night") };
   }
   function getChartData() {
-    return getAllDailyEntries(logs).map(e => ({ week: fmtShort(e.date), weight: e.weight }));
+    return getAllDailyEntries(logs, goals.startDate).map(e => ({ week: fmtShort(e.date), weight: e.weight }));
   }
   function getGainRate() {
-    const entries = getAllDailyEntries(logs);
+    const entries = getAllDailyEntries(logs, goals.startDate);
     if (entries.length < 2) return null;
     const todayD = new Date(todayStr() + "T00:00:00");
     function windowAvg(endD, days) {
@@ -562,7 +603,7 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
     return (recentAvg - priorAvg).toFixed(2);
   }
   function getStreak() {
-    const weeks = getAllWeekKeys(logs).reverse();
+    const weeks = getAllLoggedWeekKeys(logs, goals.startDate).reverse();
     let streak = 0;
     for (const wk of weeks) {
       const done = Object.values((logs[wk].sessions || {})).filter(v => v === "done").length;
@@ -572,8 +613,8 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
   }
 
   const chartData = getChartData();
-  const latestWeight = chartData.length > 0 ? chartData[chartData.length-1].weight : START_WEIGHT;
-  const progress = Math.min(100, Math.max(0, ((latestWeight - START_WEIGHT) / (TARGET_WEIGHT - START_WEIGHT)) * 100));
+  const latestWeight = getRollingCurrentWeight(logs, goals.startDate) ?? goals.startWeight;
+  const progress = Math.min(100, Math.max(0, ((latestWeight - goals.startWeight) / (goals.targetWeight - goals.startWeight)) * 100));
   const gainRate = getGainRate();
   const streak = getStreak();
   const macros = getWeekMacros();
@@ -623,7 +664,7 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
             <div style={{ fontSize: 30, fontWeight: 700, letterSpacing: -1, lineHeight: 1 }}>
               {latestWeight.toFixed(1)}<span style={{ fontSize: 14, color: p.muted, fontWeight: 400 }}> kg</span>
               <span style={{ color: p.dim, margin: "0 8px", fontWeight: 300 }}>→</span>
-              <span style={{ color: p.green }}>70 kg</span>
+              <span style={{ color: p.green }}>{goals.targetWeight} kg</span>
             </div>
           </div>
           <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 5 }}>
@@ -644,9 +685,9 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
           <div style={{ height: "100%", borderRadius: 2, background: p.green, width: `${progress}%`, transition: "width 0.5s" }} />
         </div>
         <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 10, color: p.muted }}>
-          <span>60.5 kg</span>
+          <span>{goals.startWeight} kg</span>
           <span>{syncBadge() || `${progress.toFixed(0)}% to goal`}</span>
-          <span>70 kg</span>
+          <span>{goals.targetWeight} kg</span>
         </div>
       </div>
 
@@ -669,6 +710,20 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
               <button onClick={exportBackup} style={{ flex: 1, padding: "8px 10px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 8, color: p.text, fontSize: 12, cursor: "pointer" }}>⬇ Export .json</button>
               <button onClick={() => fileInputRef.current?.click()} style={{ flex: 1, padding: "8px 10px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 8, color: p.text, fontSize: 12, cursor: "pointer" }}>⬆ Import .json</button>
               <input ref={fileInputRef} type="file" accept="application/json" style={{ display: "none" }} onChange={importBackup} />
+            </div>
+            <div style={{ fontSize: 11, letterSpacing: 2, color: p.muted, textTransform: "uppercase", fontWeight: 600, marginTop: 6 }}>Goal</div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 10, color: p.muted, marginBottom: 3 }}>Start weight (kg)</div>
+                <input type="number" step="0.1" value={goalInputs.startWeight} onChange={e => setGoalInputs({ ...goalInputs, startWeight: e.target.value })}
+                  style={{ width: "100%", padding: "7px 9px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, fontSize: 13 }} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 10, color: p.muted, marginBottom: 3 }}>Target weight (kg)</div>
+                <input type="number" step="0.1" value={goalInputs.targetWeight} onChange={e => setGoalInputs({ ...goalInputs, targetWeight: e.target.value })}
+                  style={{ width: "100%", padding: "7px 9px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, fontSize: 13 }} />
+              </div>
+              <button onClick={saveGoals} style={{ alignSelf: "flex-end", padding: "7px 12px", background: p.blue, border: "none", borderRadius: 8, color: "#fff", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Save</button>
             </div>
             {(syncStatus === "unauthorized") && (
               <div style={{ fontSize: 11, color: p.red }}>Your token isn't working anymore. Disconnect and set up again with a fresh token — your data is safe locally in the meantime.</div>
@@ -799,18 +854,21 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
               <div style={{ padding: "12px 14px" }}>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4, marginBottom: 10 }}>
                   {DAY_LABELS.map((d, i) => {
-                    const isFuture = dateForWeekDay(activeWeek, i) > todayStr();
+                    const cellDate = dateForWeekDay(activeWeek, i);
+                    const isFuture = cellDate > todayStr();
+                    const isToday = cellDate === todayStr();
                     const val = dailyWeights[i];
                     const isActive = activeWeightDay === i;
                     return (
                       <button key={i} disabled={isFuture} onClick={() => selectWeightDay(i)} style={{
-                        padding: "6px 2px", borderRadius: 7, cursor: isFuture ? "default" : "pointer", fontFamily: "inherit",
+                        padding: "6px 2px", borderRadius: 7, cursor: isFuture ? "default" : "pointer", fontFamily: "inherit", position: "relative",
                         border: `1.5px solid ${isActive ? p.blue : val != null ? p.greenBorder : p.border}`,
                         background: isActive ? p.blueLight : val != null ? p.greenLight : p.bg,
                         opacity: isFuture ? 0.35 : 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
                       }}>
                         <span style={{ fontSize: 9, color: p.muted, fontWeight: 600 }}>{d}</span>
                         <span style={{ fontSize: 10, color: val != null ? p.green : p.dim, fontWeight: 600 }}>{val != null ? val : "–"}</span>
+                        {isToday && <span style={{ position: "absolute", top: 3, right: 3, width: 4, height: 4, borderRadius: "50%", background: p.blue }} />}
                       </button>
                     );
                   })}
@@ -820,6 +878,9 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
                     style={{ flex: 1, padding: "10px 12px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, color: p.text, fontSize: 18, fontFamily: "inherit", outline: "none" }} />
                   <span style={{ color: p.muted, fontSize: 12 }}>kg</span>
                   <button onClick={saveWeight} style={{ padding: "10px 16px", background: p.blue, border: "none", borderRadius: 8, color: "#fff", fontWeight: 600, fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>Save</button>
+                  {dailyWeights[activeWeightDay] != null && (
+                    <button onClick={clearWeight} style={{ padding: "10px 12px", background: p.redLight, border: `1px solid ${p.redBorder}`, borderRadius: 8, color: p.red, fontWeight: 600, fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>Clear</button>
+                  )}
                 </div>
                 <div style={{ fontSize: 11, color: p.muted, marginTop: 7 }}>
                   Editing <strong style={{ color: p.text }}>{DAY_LABELS[activeWeightDay]}</strong>{dailyWeights[activeWeightDay] != null && <span style={{ color: p.green }}> · ✓ saved</span>}
@@ -846,8 +907,8 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
             <div style={{ display: "flex", gap: 10 }}>
               {[
                 { label: "Current", val: `${latestWeight.toFixed(1)} kg`, color: p.text },
-                { label: "Gained", val: `+${(latestWeight - START_WEIGHT).toFixed(1)} kg`, color: p.green },
-                { label: "To go", val: `${Math.max(0, TARGET_WEIGHT - latestWeight).toFixed(1)} kg`, color: p.blue },
+                { label: "Gained", val: `${latestWeight - goals.startWeight >= 0 ? "+" : ""}${(latestWeight - goals.startWeight).toFixed(1)} kg`, color: p.green },
+                { label: "To go", val: `${Math.max(0, goals.targetWeight - latestWeight).toFixed(1)} kg`, color: p.blue },
               ].map(s => (
                 <div key={s.label} style={{ flex: 1, padding: "12px 8px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 10, textAlign: "center" }}>
                   <div style={{ fontSize: 16, fontWeight: 700, color: s.color }}>{s.val}</div>
@@ -868,7 +929,7 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
 
             <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, padding: "14px 8px 8px" }}>
               <div style={{ fontSize: 10, letterSpacing: 2, color: p.muted, textTransform: "uppercase", padding: "0 8px", marginBottom: 10 }}>Weight (kg)</div>
-              <WeightChart data={chartData} target={TARGET_WEIGHT} />
+              <WeightChart data={chartData} target={goals.targetWeight} />
             </div>
 
             {/* Shake Heatmap */}
@@ -911,19 +972,13 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, marginBottom: 6 }}>
                       {DAY_LABELS.map(d => <div key={d} style={{ textAlign: "center", fontSize: 9, color: p.muted, fontWeight: 600 }}>{d}</div>)}
                     </div>
-                    <div style={{ fontSize: 10, color: p.muted, marginBottom: 4 }}>🌅 Morning</div>
                     {weeks.map((week, wi) => (
-                      <div key={`m-${wi}`} style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, marginBottom: 2 }}>
+                      <div key={`w-${wi}`} style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, marginBottom: 3 }}>
                         {[...week, ...Array(7-week.length).fill(null)].map((cell, ci) => (
-                          <div key={ci} style={{ height: 14, borderRadius: 3, background: !cell ? "transparent" : cell.future ? p.border : cell.morning ? p.green : p.border, opacity: !cell ? 0 : cell.future ? 0.2 : cell.morning ? 1 : 0.3 }} />
-                        ))}
-                      </div>
-                    ))}
-                    <div style={{ fontSize: 10, color: p.muted, margin: "8px 0 4px" }}>🌙 Night</div>
-                    {weeks.map((week, wi) => (
-                      <div key={`n-${wi}`} style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, marginBottom: 2 }}>
-                        {[...week, ...Array(7-week.length).fill(null)].map((cell, ci) => (
-                          <div key={ci} style={{ height: 14, borderRadius: 3, background: !cell ? "transparent" : cell.future ? p.border : cell.night ? p.blue : p.border, opacity: !cell ? 0 : cell.future ? 0.2 : cell.night ? 1 : 0.3 }} />
+                          <div key={ci} style={{ height: 22, borderRadius: 3, overflow: "hidden", opacity: !cell ? 0 : cell.future ? 0.25 : 1, display: "flex", flexDirection: "column", gap: 1 }}>
+                            <div style={{ flex: 1, background: !cell ? "transparent" : cell.morning ? p.green : p.border }} />
+                            <div style={{ flex: 1, background: !cell ? "transparent" : cell.night ? p.blue : p.border }} />
+                          </div>
                         ))}
                       </div>
                     ))}
@@ -1006,10 +1061,10 @@ function Tracker({ auth, initialLogs, initialSyncStatus, onDisconnect }) {
         {/* ══ HISTORY ══ */}
         {view === "history" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {getAllWeekKeys(logs).length === 0 ? (
+            {getAllLoggedWeekKeys(logs, goals.startDate).length === 0 ? (
               <div style={{ textAlign: "center", color: p.dim, padding: "60px 0", fontSize: 13 }}>No history yet — start logging!</div>
             ) : (
-              getAllWeekKeys(logs).slice().reverse().map(wk => {
+              getAllLoggedWeekKeys(logs, goals.startDate).slice().reverse().map(wk => {
                 const wl = logs[wk] || {};
                 const done = Object.values(wl.sessions || {}).filter(v => v === "done").length;
                 const ms = getWeekShakeCount(wk, "morning");
@@ -1048,6 +1103,7 @@ function App() {
   const [phase, setPhase] = useState("boot"); // boot|onboarding|ready
   const [auth, setAuth] = useState(null);
   const [initialLogs, setInitialLogs] = useState({});
+  const [initialGoals, setInitialGoals] = useState(null);
   const [initialSyncStatus, setInitialSyncStatus] = useState("idle");
   const [bootError, setBootError] = useState("");
 
@@ -1067,6 +1123,7 @@ function App() {
       }
       setAuth(savedAuth);
       setInitialLogs(winner.logs || {});
+      setInitialGoals(winner.goals || null);
       writeLocalCache(winner);
       if (needsPush) {
         updateGistPayload(savedAuth.token, savedAuth.gistId, winner).catch(() => {});
@@ -1078,6 +1135,7 @@ function App() {
         if (localCache) {
           setAuth(savedAuth);
           setInitialLogs(localCache.logs || {});
+          setInitialGoals(localCache.goals || null);
           setInitialSyncStatus("unauthorized");
           setPhase("ready");
         } else {
@@ -1089,6 +1147,7 @@ function App() {
         if (localCache) {
           setAuth(savedAuth);
           setInitialLogs(localCache.logs || {});
+          setInitialGoals(localCache.goals || null);
           setInitialSyncStatus("offline");
           setPhase("ready");
         } else {
@@ -1105,12 +1164,14 @@ function App() {
         const cloud = await fetchGistPayload(newAuth.token, newAuth.gistId);
         setAuth(newAuth);
         setInitialLogs(cloud.logs || {});
+        setInitialGoals(cloud.goals || null);
         writeLocalCache(cloud);
         setInitialSyncStatus("saved");
         setPhase("ready");
       } catch (e) {
         setAuth(newAuth);
         setInitialLogs({});
+        setInitialGoals(null);
         setInitialSyncStatus("offline");
         setPhase("ready");
       }
@@ -1135,7 +1196,7 @@ function App() {
       </>
     );
   }
-  return <Tracker auth={auth} initialLogs={initialLogs} initialSyncStatus={initialSyncStatus} onDisconnect={handleDisconnect} />;
+  return <Tracker auth={auth} initialLogs={initialLogs} initialGoals={initialGoals} initialSyncStatus={initialSyncStatus} onDisconnect={handleDisconnect} />;
 }
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
