@@ -425,6 +425,7 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
   const [activeWeek, setActiveWeek] = useState(getSundayOfWeek(todayStr()));
   const [showWeekPicker, setShowWeekPicker] = useState(false);
   const [activeSkip, setActiveSkip] = useState(null);
+  const [activeDatePicker, setActiveDatePicker] = useState(null);
   const [weightInput, setWeightInput] = useState("");
   const [activeWeightDay, setActiveWeightDay] = useState(new Date().getDay());
   const [noteInput, setNoteInput] = useState("");
@@ -533,6 +534,11 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
     delete d[id]; // skipped sessions aren't "done", so no completion date
     persist({ ...logs, [activeWeek]: { ...wlog, sessions: s, skipReasons: r, sessionDates: d } });
     setActiveSkip(null);
+  }
+
+  function setSessionDate(id, dateStr) {
+    persist({ ...logs, [activeWeek]: { ...wlog, sessionDates: { ...sessionDates, [id]: dateStr } } });
+    setActiveDatePicker(null);
   }
 
   function saveWeight() {
@@ -850,13 +856,34 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
                       <div>
                         <div style={{ fontSize: 13 }}>{s.label}</div>
                         {status === "skipped" && skipReasons[s.id] && <div style={{ fontSize: 10, color: p.red, marginTop: 2 }}>{SKIP_REASONS.find(r => r.id === skipReasons[s.id])?.label}</div>}
-                        {status === "done" && sessionDates[s.id] && <div style={{ fontSize: 10, color: p.dim, marginTop: 2 }}>{dayName(sessionDates[s.id])}</div>}
+                        {status === "done" && sessionDates[s.id] && (
+                          <div onClick={() => setActiveDatePicker(activeDatePicker === s.id ? null : s.id)} style={{ fontSize: 10, color: p.dim, marginTop: 2, cursor: "pointer", textDecoration: "underline", textDecorationStyle: "dotted", width: "fit-content" }}>
+                            {dayName(sessionDates[s.id])}
+                          </div>
+                        )}
                       </div>
                       <div style={{ display: "flex", gap: 6 }}>
                         <button onClick={() => handleSession(s.id, true)} style={{ padding: "6px 11px", borderRadius: 7, fontSize: 11, cursor: "pointer", fontFamily: "inherit", background: status === "done" ? p.green : p.white, border: `1px solid ${status === "done" ? p.green : p.greenBorder}`, color: status === "done" ? "#fff" : p.green, fontWeight: 500 }}>✓ Done</button>
                         <button onClick={() => handleSession(s.id, false)} style={{ padding: "6px 11px", borderRadius: 7, fontSize: 11, cursor: "pointer", fontFamily: "inherit", background: status === "skipped" ? p.red : p.white, border: `1px solid ${status === "skipped" ? p.red : p.redBorder}`, color: status === "skipped" ? "#fff" : p.red, fontWeight: 500 }}>✗ Skip</button>
                       </div>
                     </div>
+                    {activeDatePicker === s.id && (
+                      <div style={{ background: p.bg, padding: "8px 14px", display: "flex", gap: 4 }}>
+                        {DAY_LABELS.map((d, di) => {
+                          const cellDate = dateForWeekDay(activeWeek, di);
+                          const isFutureDay = cellDate > todayStr();
+                          const isSelected = sessionDates[s.id] === cellDate;
+                          return (
+                            <button key={di} disabled={isFutureDay} onClick={() => setSessionDate(s.id, cellDate)} style={{
+                              flex: 1, padding: "5px 0", borderRadius: 6, fontSize: 10, fontWeight: 600, fontFamily: "inherit",
+                              cursor: isFutureDay ? "default" : "pointer", opacity: isFutureDay ? 0.3 : 1,
+                              border: `1px solid ${isSelected ? p.blue : p.border}`,
+                              background: isSelected ? p.blueLight : p.white, color: isSelected ? p.blue : p.text,
+                            }}>{d[0]}</button>
+                          );
+                        })}
+                      </div>
+                    )}
                     {isSkipping && (
                       <div style={{ background: p.bg }}>
                         <div style={{ padding: "6px 14px 2px", fontSize: 10, color: p.muted, letterSpacing: 2, textTransform: "uppercase" }}>Reason?</div>
