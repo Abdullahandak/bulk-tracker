@@ -56,12 +56,11 @@ const GIST_FILENAME = "bulk-tracker-data.json";
 const LS_AUTH = "bulkTrackerAuth_v1";
 const LS_CACHE = "bulkTrackerCache_v1";
 
-const START_WEIGHT = 60.5;
-const TARGET_WEIGHT = 70;
 const START_DATE = "2026-07-05";
 const SHAKE_MACROS = { kcal: 955, protein: 58, carbs: 77, fat: 50 };
 const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const RANGE_DAYS = { "1M": 30, "3M": 90, "6M": 182 };
 
 const SKIP_REASONS = [
   { id: "work",   label: "💼 Heavy work / on-call" },
@@ -116,57 +115,58 @@ function dateForWeekDay(wk, dayIdx) {
   d.setDate(d.getDate() + Number(dayIdx));
   return toDateStr(d);
 }
-function getWeekWeightAvg(logs, wk) {
-  const wl = logs[wk] || {};
-  const dw = wl.dailyWeights || {};
-  const vals = Object.values(dw).filter(v => typeof v === "number" && !isNaN(v));
-  if (vals.length) return vals.reduce((a, b) => a + b, 0) / vals.length;
-  if (typeof wl.weight === "number") return wl.weight; // legacy fallback (pre-daily-log data)
-  return null;
-}
-function getAllDailyEntries(logs, startDate) {
-  const cutoff = startDate || START_DATE;
-  const entries = [];
-  Object.keys(logs).forEach(wk => {
-    if (wk < cutoff) return;
-    const wl = logs[wk] || {};
-    const dw = wl.dailyWeights || {};
-    const keys = Object.keys(dw);
-    if (keys.length) {
-      keys.forEach(dayIdx => {
-        const v = dw[dayIdx];
-        if (typeof v !== "number" || isNaN(v)) return;
-        entries.push({ date: dateForWeekDay(wk, dayIdx), weight: v });
-      });
-    } else if (typeof wl.weight === "number") {
-      entries.push({ date: wk, weight: wl.weight }); // legacy fallback
-    }
-  });
-  return entries.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
-}
-function getRollingCurrentWeight(logs, startDate) {
-  const entries = getAllDailyEntries(logs, startDate);
-  if (!entries.length) return null;
-  const todayD = new Date(todayStr() + "T00:00:00");
-  const windowStart = new Date(todayD); windowStart.setDate(windowStart.getDate() - 6);
-  const recent = entries.filter(e => { const d = new Date(e.date + "T00:00:00"); return d >= windowStart && d <= todayD; });
-  const pool = recent.length ? recent : [entries[entries.length - 1]];
-  return pool.reduce((a, b) => a + b.weight, 0) / pool.length;
-}
-// Weeks with ANY logged activity (weight, training, shakes, or a note) — used for
-// History and the training streak, so a week you trained but skipped weighing
-// in still shows up and still counts.
+// Weeks with ANY logged activity (training, shakes, or a note) — used for
+// History and the training streak, so a week you trained but didn't log a
+// shake still shows up and still counts.
 function getAllLoggedWeekKeys(logs, startDate) {
   const cutoff = startDate || START_DATE;
   return Object.keys(logs).filter(k => {
     if (k < cutoff) return false;
     const wl = logs[k] || {};
-    const hasWeight = getWeekWeightAvg(logs, k) !== null;
     const hasSessions = wl.sessions && Object.values(wl.sessions).some(v => v === "done" || v === "skipped");
     const hasShakes = wl.shakes && Object.values(wl.shakes).some(Boolean);
     const hasNote = !!wl.note;
-    return hasWeight || hasSessions || hasShakes || hasNote;
+    return hasSessions || hasShakes || hasNote;
   }).sort();
+}
+// A session's displayed/counted status: whatever was explicitly logged, or — once
+// the week it belongs to has fully finished — an automatic "skipped" so nothing
+// needs to be manually marked. The underlying stored data is never mutated by this;
+// it's purely a display/aggregation-time fallback.
+function getEffectiveStatus(wl, sessionId, wk) {
+  const raw = (wl.sessions || {})[sessionId];
+  if (raw === "done" || raw === "skipped") return raw;
+  if (dateForWeekDay(wk, 6) < todayStr()) return "skipped";
+  return null;
+}
+// Single daily shake: how many of the 7 days this week had the shake logged.
+function getWeekShakeCount(logs, wk) {
+  const shakes = (logs[wk] || {}).shakes || {};
+  return [0, 1, 2, 3, 4, 5, 6].filter(i => shakes[i]).length;
+}
+// Combined weekly score: training completion % and shake consistency % averaged.
+function getWeekCompliance(logs, wk) {
+  const wl = logs[wk] || {};
+  const doneCount = SESSIONS.filter(s => getEffectiveStatus(wl, s.id, wk) === "done").length;
+  const trainingPct = (doneCount / 4) * 100;
+  const shakePct = (getWeekShakeCount(logs, wk) / 7) * 100;
+  return Math.round((trainingPct + shakePct) / 2);
+}
+// All week-Sundays touched by a rolling window of `rangeDays` ending today,
+// restricted to the program start date and to weeks that have fully finished
+// (so an in-progress current week never shows up half-counted).
+function getWeeksInRange(rangeDays, startDate) {
+  const cutoff = startDate || START_DATE;
+  const today = todayStr();
+  const rangeStartD = new Date(today + "T00:00:00");
+  rangeStartD.setDate(rangeStartD.getDate() - rangeDays);
+  const sundays = new Set();
+  const d = new Date(rangeStartD);
+  while (toDateStr(d) <= today) {
+    sundays.add(getSundayOfWeek(toDateStr(d)));
+    d.setDate(d.getDate() + 1);
+  }
+  return [...sundays].filter(wk => wk >= cutoff && dateForWeekDay(wk, 6) < today).sort();
 }
 // Percentage breakdown of completed ("done") training sessions by day of week.
 // Only counts sessions that have a recorded completion date (sessionDates) —
@@ -198,19 +198,6 @@ function getPast16Weeks() {
     d.setDate(d.getDate() - 7);
   }
   return [...result].sort();
-}
-function getDaysInMonth(year, month) {
-  const days = [];
-  const d = new Date(year, month, 1);
-  while (d.getMonth() === month) {
-    days.push(toDateStr(d));
-    d.setDate(d.getDate() + 1);
-  }
-  return days;
-}
-function getShakeStatus(logs, weekKey, dayIdx) {
-  const shakes = (logs[weekKey] || {}).shakes || {};
-  return { morning: !!shakes[`morning_${dayIdx}`], night: !!shakes[`night_${dayIdx}`] };
 }
 
 /* ============================== CLOUD SYNC (GitHub Gist) ============================== */
@@ -299,47 +286,6 @@ function writeLocalCache(payload) {
   try { localStorage.setItem(LS_CACHE, JSON.stringify(payload)); } catch (e) {}
 }
 
-/* ============================== SMALL SVG WEIGHT CHART ============================== */
-/* Hand-rolled instead of pulling in a charting library — one less thing that can
-   fail to load and break the whole app. */
-
-function WeightChart({ data, target }) {
-  if (!data.length) {
-    return <div style={{ textAlign: "center", color: p.dim, padding: "40px 0", fontSize: 13 }}>No data yet.</div>;
-  }
-  const width = 400, height = 220;
-  const pad = { top: 14, right: 18, bottom: 24, left: 34 };
-  const weights = data.map(d => d.weight);
-  const minY = Math.min(59, Math.min(...weights) - 1);
-  const maxY = Math.max(71, Math.max(...weights) + 1, target + 1);
-  const innerW = width - pad.left - pad.right;
-  const innerH = height - pad.top - pad.bottom;
-  const xStep = data.length > 1 ? innerW / (data.length - 1) : 0;
-  const xPos = i => pad.left + (data.length > 1 ? i * xStep : innerW / 2);
-  const yPos = v => pad.top + innerH * (1 - (v - minY) / (maxY - minY));
-  const pathD = data.map((d, i) => `${i === 0 ? "M" : "L"} ${xPos(i).toFixed(1)} ${yPos(d.weight).toFixed(1)}`).join(" ");
-  const gridVals = [0, 0.25, 0.5, 0.75, 1].map(f => minY + f * (maxY - minY));
-  const labelEvery = Math.max(1, Math.ceil(data.length / 6));
-
-  return (
-    <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height: "auto", display: "block" }}>
-      {gridVals.map((gy, i) => (
-        <line key={i} x1={pad.left} x2={width - pad.right} y1={yPos(gy)} y2={yPos(gy)} stroke={p.border} strokeDasharray="2 5" />
-      ))}
-      {gridVals.map((gy, i) => (
-        <text key={"yl" + i} x={pad.left - 5} y={yPos(gy) + 3} textAnchor="end" fontSize="8" fill={p.dim}>{gy.toFixed(1)}</text>
-      ))}
-      <line x1={pad.left} x2={width - pad.right} y1={yPos(target)} y2={yPos(target)} stroke={p.green} strokeDasharray="5 3" strokeOpacity="0.6" />
-      <text x={width - pad.right} y={yPos(target) - 4} textAnchor="end" fontSize="9" fill={p.green}>{target} kg</text>
-      <path d={pathD} fill="none" stroke={p.blue} strokeWidth="2.5" />
-      {data.map((d, i) => <circle key={i} cx={xPos(i)} cy={yPos(d.weight)} r="4" fill={p.blue} />)}
-      {data.map((d, i) => (i % labelEvery === 0 || i === data.length - 1) && (
-        <text key={"l" + i} x={xPos(i)} y={height - 6} textAnchor="middle" fontSize="9" fill={p.muted}>{d.week}</text>
-      ))}
-    </svg>
-  );
-}
-
 /* ============================== ONBOARDING ============================== */
 
 function Onboarding({ onReady }) {
@@ -356,7 +302,7 @@ function Onboarding({ onReady }) {
     setBusy(true); setErr("");
     try {
       const token = tokenInput.trim();
-      const initialPayload = { updatedAt: new Date().toISOString(), logs: {}, goals: { startWeight: START_WEIGHT, targetWeight: TARGET_WEIGHT, startDate: START_DATE } };
+      const initialPayload = { updatedAt: new Date().toISOString(), logs: {}, goals: { startDate: START_DATE } };
       const gistId = await createGist(token, initialPayload);
       const auth = { token, gistId };
       writeLocalAuth(auth);
@@ -469,13 +415,13 @@ function Onboarding({ onReady }) {
 
 function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconnect }) {
   const [logs, setLogs] = useState(initialLogs);
-  const [goals, setGoals] = useState(initialGoals || { startWeight: START_WEIGHT, targetWeight: TARGET_WEIGHT, startDate: START_DATE });
-  const [goalInputs, setGoalInputs] = useState({ startWeight: String((initialGoals || {}).startWeight ?? START_WEIGHT), targetWeight: String((initialGoals || {}).targetWeight ?? TARGET_WEIGHT) });
+  const startDate = (initialGoals && initialGoals.startDate) || START_DATE;
   const [view, setView] = useState("log");
   const [activeWeek, setActiveWeek] = useState(getSundayOfWeek(todayStr()));
   const [showWeekPicker, setShowWeekPicker] = useState(false);
   const [activeSkip, setActiveSkip] = useState(null);
   const [activeDatePicker, setActiveDatePicker] = useState(null);
+  const [chartRange, setChartRange] = useState("1M");
   const [theme, setTheme] = useState(() => localStorage.getItem("bulkTrackerTheme") || "light");
 
   function toggleTheme() {
@@ -484,17 +430,10 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
     document.documentElement.setAttribute("data-theme", next);
     localStorage.setItem("bulkTrackerTheme", next);
   }
-  const [weightInput, setWeightInput] = useState("");
-  const [activeWeightDay, setActiveWeightDay] = useState(new Date().getDay());
   const [noteInput, setNoteInput] = useState("");
   const [syncStatus, setSyncStatus] = useState(initialSyncStatus || "idle"); // idle|pending|saving|saved|offline|error
   const [showSettings, setShowSettings] = useState(false);
   const [copied, setCopied] = useState(false);
-  const nowDate = new Date();
-  const [heatmapYear, setHeatmapYear] = useState(nowDate.getFullYear());
-  const [heatmapMonth, setHeatmapMonth] = useState(nowDate.getMonth());
-  const [exHeatmapYear, setExHeatmapYear] = useState(nowDate.getFullYear());
-  const [exHeatmapMonth, setExHeatmapMonth] = useState(nowDate.getMonth());
   const saveTimer = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -503,42 +442,20 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
   const skipReasons = wlog.skipReasons || {};
   const sessionDates = wlog.sessionDates || {};
   const shakes = wlog.shakes || {};
-  const dailyWeights = wlog.dailyWeights || {};
-  const sessionsDone = Object.values(sessions).filter(v => v === "done").length;
+  const sessionsDone = SESSIONS.filter(s => getEffectiveStatus(wlog, s.id, activeWeek) === "done").length;
   const isCurrentWeek = activeWeek === getSundayOfWeek(todayStr());
 
   useEffect(() => { loadWeekData(logs, activeWeek); }, []); // eslint-disable-line
 
   function loadWeekData(data, wk) {
     const w = data[wk] || {};
-    const dw = w.dailyWeights || {};
-    let dayIdx;
-    if (wk === getSundayOfWeek(todayStr())) {
-      dayIdx = new Date().getDay();
-    } else {
-      const keys = Object.keys(dw).map(Number);
-      dayIdx = keys.length ? Math.max(...keys) : 0;
-    }
-    setActiveWeightDay(dayIdx);
-    const existing = dw[dayIdx];
-    const legacyOnly = Object.keys(dw).length === 0 && typeof w.weight === "number";
-    setWeightInput(existing != null ? String(existing) : legacyOnly ? String(w.weight) : "");
     setNoteInput(w.note || "");
     setActiveSkip(null);
   }
 
-  function selectWeightDay(dayIdx) {
-    if (dateForWeekDay(activeWeek, dayIdx) > todayStr()) return; // can't log future days
-    setActiveWeightDay(dayIdx);
-    const existing = dailyWeights[dayIdx];
-    setWeightInput(existing != null ? String(existing) : "");
-  }
-
-  function persist(updatedLogs, updatedGoals) {
-    const g = updatedGoals || goals;
+  function persist(updatedLogs) {
     setLogs(updatedLogs);
-    if (updatedGoals) setGoals(updatedGoals);
-    const payload = { updatedAt: new Date().toISOString(), logs: updatedLogs, goals: g };
+    const payload = { updatedAt: new Date().toISOString(), logs: updatedLogs, goals: { startDate } };
     writeLocalCache(payload); // instant, synchronous — safe even if the app is killed right after this
     setSyncStatus("pending");
     if (saveTimer.current) clearTimeout(saveTimer.current);
@@ -554,22 +471,14 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
     }, 700);
   }
 
-  function saveGoals() {
-    const sw = parseFloat(goalInputs.startWeight);
-    const tw = parseFloat(goalInputs.targetWeight);
-    if (isNaN(sw) || isNaN(tw) || sw < 30 || sw > 250 || tw < 30 || tw > 250) return;
-    persist(logs, { ...goals, startWeight: sw, targetWeight: tw });
-  }
-
   function switchWeek(wk) {
     setActiveWeek(wk);
     setShowWeekPicker(false);
     loadWeekData(logs, wk);
   }
 
-  function toggleShake(type, dayIndex) {
-    const key = `${type}_${dayIndex}`;
-    persist({ ...logs, [activeWeek]: { ...wlog, shakes: { ...shakes, [key]: !shakes[key] } } });
+  function toggleShake(dayIndex) {
+    persist({ ...logs, [activeWeek]: { ...wlog, shakes: { ...shakes, [dayIndex]: !shakes[dayIndex] } } });
   }
 
   function handleSession(id, done) {
@@ -597,22 +506,6 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
   function setSessionDate(id, dateStr) {
     persist({ ...logs, [activeWeek]: { ...wlog, sessionDates: { ...sessionDates, [id]: dateStr } } });
     setActiveDatePicker(null);
-  }
-
-  function saveWeight() {
-    const w = parseFloat(weightInput);
-    if (isNaN(w) || w < 40 || w > 200) return;
-    const updatedWeekLog = { ...wlog, dailyWeights: { ...dailyWeights, [activeWeightDay]: w } };
-    delete updatedWeekLog.weight; // migrate off the old single-weekly-value field
-    persist({ ...logs, [activeWeek]: updatedWeekLog });
-  }
-
-  function clearWeight() {
-    if (dailyWeights[activeWeightDay] == null) return;
-    const newDaily = { ...dailyWeights };
-    delete newDaily[activeWeightDay];
-    persist({ ...logs, [activeWeek]: { ...wlog, dailyWeights: newDaily } });
-    setWeightInput("");
   }
 
   function saveNote() {
@@ -662,33 +555,8 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
     e.target.value = "";
   }
 
-  function getWeekShakeCount(wk, type) {
-    const s = (logs[wk] || {}).shakes || {};
-    return [0,1,2,3,4,5,6].filter(i => s[`${type}_${i}`]).length;
-  }
-  function getWeekMacros() {
-    return { morning: getWeekShakeCount(activeWeek, "morning"), night: getWeekShakeCount(activeWeek, "night") };
-  }
-  function getChartData() {
-    return getAllDailyEntries(logs, goals.startDate).map(e => ({ week: fmtShort(e.date), weight: e.weight }));
-  }
-  function getGainRate() {
-    const entries = getAllDailyEntries(logs, goals.startDate);
-    if (entries.length < 2) return null;
-    const todayD = new Date(todayStr() + "T00:00:00");
-    function windowAvg(endD, days) {
-      const start = new Date(endD); start.setDate(start.getDate() - days + 1);
-      const vals = entries.filter(e => { const d = new Date(e.date + "T00:00:00"); return d >= start && d <= endD; }).map(e => e.weight);
-      return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
-    }
-    const recentAvg = windowAvg(todayD, 7);
-    const priorEnd = new Date(todayD); priorEnd.setDate(priorEnd.getDate() - 7);
-    const priorAvg = windowAvg(priorEnd, 7);
-    if (recentAvg == null || priorAvg == null) return null;
-    return (recentAvg - priorAvg).toFixed(2);
-  }
   function getStreak() {
-    const weeks = getAllLoggedWeekKeys(logs, goals.startDate).reverse();
+    const weeks = getAllLoggedWeekKeys(logs, startDate).reverse();
     let streak = 0;
     for (const wk of weeks) {
       const done = Object.values((logs[wk].sessions || {})).filter(v => v === "done").length;
@@ -697,29 +565,9 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
     return streak;
   }
 
-  const chartData = getChartData();
-  const latestWeight = getRollingCurrentWeight(logs, goals.startDate) ?? goals.startWeight;
-  const progress = Math.min(100, Math.max(0, ((latestWeight - goals.startWeight) / (goals.targetWeight - goals.startWeight)) * 100));
-  const gainRate = getGainRate();
   const streak = getStreak();
-  const macros = getWeekMacros();
-  const past16Weeks = getPast16Weeks().filter(wk => wk >= goals.startDate);
-
-  function gainColor() {
-    if (!gainRate) return p.muted;
-    const r = parseFloat(gainRate);
-    if (r >= 0.25 && r <= 0.6) return p.green;
-    if (r > 0.6) return p.amber;
-    return p.red;
-  }
-  function gainLabel() {
-    if (!gainRate) return "–";
-    const r = parseFloat(gainRate);
-    if (r >= 0.25 && r <= 0.6) return "On track";
-    if (r > 0.6) return "Too fast";
-    if (r > 0) return "Too slow — eat more";
-    return "Losing weight";
-  }
+  const weekShakeCount = getWeekShakeCount(logs, activeWeek);
+  const past16Weeks = getPast16Weeks().filter(wk => wk >= startDate);
 
   function syncBadge() {
     const map = {
@@ -743,14 +591,11 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
 
       {/* HEADER */}
       <div style={{ background: p.white, borderBottom: `1px solid ${p.border}`, padding: "20px 20px 16px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
           <div>
             <div style={{ fontSize: 10, letterSpacing: 4, color: p.muted, marginBottom: 5, textTransform: "uppercase", fontWeight: 500 }}>Bulk Tracker</div>
-            <div style={{ fontSize: 30, fontWeight: 700, letterSpacing: -1, lineHeight: 1 }}>
-              {latestWeight.toFixed(1)}<span style={{ fontSize: 14, color: p.muted, fontWeight: 400 }}> kg</span>
-              <span style={{ color: p.dim, margin: "0 8px", fontWeight: 300 }}>→</span>
-              <span style={{ color: p.green }}>{goals.targetWeight} kg</span>
-            </div>
+            <div style={{ fontSize: 20, fontWeight: 700 }}>{isCurrentWeek ? "This week" : `Week of ${fmtShort(activeWeek)}`}</div>
+            <div style={{ fontSize: 12, color: p.muted, marginTop: 3 }}>{sessionsDone}/4 training · {weekShakeCount}/7 shakes</div>
           </div>
           <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 5 }}>
             <div style={{ display: "flex", gap: 6 }}>
@@ -762,20 +607,8 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
                 🔥 {streak}w streak
               </span>
             )}
-            {gainRate && (
-              <span style={{ fontSize: 11, color: gainColor(), fontWeight: 600 }}>
-                {gainRate > 0 ? "+" : ""}{gainRate} kg/wk · {gainLabel()}
-              </span>
-            )}
+            {syncBadge()}
           </div>
-        </div>
-        <div style={{ height: 4, background: p.border, borderRadius: 2, overflow: "hidden" }}>
-          <div style={{ height: "100%", borderRadius: 2, background: p.green, width: `${progress}%`, transition: "width 0.5s" }} />
-        </div>
-        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 10, color: p.muted }}>
-          <span>{goals.startWeight} kg</span>
-          <span>{syncBadge() || `${progress.toFixed(0)}% to goal`}</span>
-          <span>{goals.targetWeight} kg</span>
         </div>
       </div>
 
@@ -798,20 +631,6 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
               <button onClick={exportBackup} style={{ flex: 1, padding: "8px 10px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 8, color: p.text, fontSize: 12, cursor: "pointer" }}>⬇ Export .json</button>
               <button onClick={() => fileInputRef.current?.click()} style={{ flex: 1, padding: "8px 10px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 8, color: p.text, fontSize: 12, cursor: "pointer" }}>⬆ Import .json</button>
               <input ref={fileInputRef} type="file" accept="application/json" style={{ display: "none" }} onChange={importBackup} />
-            </div>
-            <div style={{ fontSize: 11, letterSpacing: 2, color: p.muted, textTransform: "uppercase", fontWeight: 600, marginTop: 6 }}>Goal</div>
-            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 10, color: p.muted, marginBottom: 3 }}>Start weight (kg)</div>
-                <input type="number" step="0.1" value={goalInputs.startWeight} onChange={e => setGoalInputs({ ...goalInputs, startWeight: e.target.value })}
-                  style={{ width: "100%", padding: "7px 9px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, fontSize: 13 }} />
-              </div>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 10, color: p.muted, marginBottom: 3 }}>Target weight (kg)</div>
-                <input type="number" step="0.1" value={goalInputs.targetWeight} onChange={e => setGoalInputs({ ...goalInputs, targetWeight: e.target.value })}
-                  style={{ width: "100%", padding: "7px 9px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, fontSize: 13 }} />
-              </div>
-              <button onClick={saveGoals} style={{ alignSelf: "flex-end", padding: "7px 12px", background: p.blue, border: "none", borderRadius: 8, color: "#fff", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Save</button>
             </div>
             {(syncStatus === "unauthorized") && (
               <div style={{ fontSize: 11, color: p.red }}>Your token isn't working anymore. Disconnect and set up again with a fresh token — your data is safe locally in the meantime.</div>
@@ -852,7 +671,7 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
                 {past16Weeks.slice().reverse().map(wk => (
                   <button key={wk} onClick={() => switchWeek(wk)} style={{ width: "100%", padding: "11px 14px", background: wk === activeWeek ? p.blueLight : "none", border: "none", borderBottom: `1px solid ${p.border}`, cursor: "pointer", fontFamily: "inherit", textAlign: "left", fontSize: 13, color: wk === activeWeek ? p.blue : p.text, display: "flex", justifyContent: "space-between" }}>
                     <span>{wk === getSundayOfWeek(todayStr()) ? "This week" : `Week of ${fmtShort(wk)}`}</span>
-                    {getWeekWeightAvg(logs, wk) != null && <span style={{ fontSize: 11, color: p.green }}>{getWeekWeightAvg(logs, wk).toFixed(1)} kg</span>}
+                    <span style={{ fontSize: 11, color: p.muted }}>{getWeekCompliance(logs, wk)}%</span>
                   </button>
                 ))}
               </div>
@@ -864,41 +683,19 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
                 <span style={{ fontSize: 11, letterSpacing: 3, color: p.muted, textTransform: "uppercase", fontWeight: 500 }}>Shakes</span>
               </div>
               <div style={{ padding: "12px 14px" }}>
-                <div style={{ display: "grid", gridTemplateColumns: "52px repeat(7, 1fr)", gap: 4, marginBottom: 8 }}>
-                  <div />
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4, marginBottom: 8 }}>
                   {DAY_LABELS.map(d => <div key={d} style={{ textAlign: "center", fontSize: 9, color: p.muted, fontWeight: 600 }}>{d}</div>)}
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: "52px repeat(7, 1fr)", gap: 4, marginBottom: 6, alignItems: "center" }}>
-                  <div style={{ fontSize: 11, color: p.muted }}>🌅 Morn</div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4, alignItems: "center" }}>
                   {[0,1,2,3,4,5,6].map(i => {
-                    const active = shakes[`morning_${i}`];
-                    return <button key={i} onClick={() => toggleShake("morning", i)} style={{ height: 28, borderRadius: 6, border: `1.5px solid ${active ? p.green : p.border}`, background: active ? p.green : p.bg, cursor: "pointer", transition: "all 0.12s" }} />;
-                  })}
-                </div>
-                <div style={{ display: "grid", gridTemplateColumns: "52px repeat(7, 1fr)", gap: 4, alignItems: "center" }}>
-                  <div style={{ fontSize: 11, color: p.muted }}>🌙 Night</div>
-                  {[0,1,2,3,4,5,6].map(i => {
-                    const active = shakes[`night_${i}`];
-                    return <button key={i} onClick={() => toggleShake("night", i)} style={{ height: 28, borderRadius: 6, border: `1.5px solid ${active ? p.blue : p.border}`, background: active ? p.blue : p.bg, cursor: "pointer", transition: "all 0.12s" }} />;
+                    const active = shakes[i];
+                    return <button key={i} onClick={() => toggleShake(i)} style={{ height: 32, borderRadius: 6, border: `1.5px solid ${active ? p.green : p.border}`, background: active ? p.green : p.bg, cursor: "pointer", transition: "all 0.12s" }} />;
                   })}
                 </div>
               </div>
-              <div style={{ padding: "10px 14px", background: p.greenLight, borderTop: `1px solid ${p.greenBorder}`, display: "flex" }}>
-                {[
-                  { label: "🌅 Morning", count: macros.morning, color: p.green },
-                  { label: "🌙 Night", count: macros.night, color: p.blue },
-                  { label: "Overall", count: macros.morning + macros.night, color: p.text },
-                ].map((m, i) => {
-                  const total = i < 2 ? 7 : 14;
-                  const pct = Math.round((m.count / total) * 100);
-                  return (
-                    <div key={m.label} style={{ flex: 1, textAlign: "center" }}>
-                      <div style={{ fontSize: 13, fontWeight: 700, color: m.color }}>{m.count}/{total}</div>
-                      <div style={{ fontSize: 9, color: p.muted, marginTop: 1 }}>{m.label}</div>
-                      <div style={{ fontSize: 10, color: m.color, fontWeight: 600 }}>{pct}%</div>
-                    </div>
-                  );
-                })}
+              <div style={{ padding: "10px 14px", background: p.greenLight, borderTop: `1px solid ${p.greenBorder}`, textAlign: "center" }}>
+                <span style={{ fontSize: 13, fontWeight: 700, color: p.green }}>{weekShakeCount}/7</span>
+                <span style={{ fontSize: 11, color: p.muted, marginLeft: 8 }}>{Math.round((weekShakeCount / 7) * 100)}%</span>
               </div>
             </div>
 
@@ -909,7 +706,7 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
                 <span style={{ fontSize: 11, color: sessionsDone === 4 ? p.green : p.muted, fontWeight: 600 }}>{sessionsDone}/4 done</span>
               </div>
               {SESSIONS.map((s, i) => {
-                const status = sessions[s.id];
+                const status = getEffectiveStatus(wlog, s.id, activeWeek);
                 const isSkipping = activeSkip === s.id;
                 return (
                   <div key={s.id}>
@@ -956,49 +753,6 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
               })}
             </div>
 
-            {/* Weight */}
-            <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, overflow: "hidden" }}>
-              <div style={{ padding: "12px 14px", borderBottom: `1px solid ${p.border}` }}>
-                <span style={{ fontSize: 11, letterSpacing: 3, color: p.muted, textTransform: "uppercase", fontWeight: 500 }}>Weight — optional, any day</span>
-              </div>
-              <div style={{ padding: "12px 14px" }}>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4, marginBottom: 10 }}>
-                  {DAY_LABELS.map((d, i) => {
-                    const cellDate = dateForWeekDay(activeWeek, i);
-                    const isFuture = cellDate > todayStr();
-                    const isToday = cellDate === todayStr();
-                    const val = dailyWeights[i];
-                    const isActive = activeWeightDay === i;
-                    return (
-                      <button key={i} disabled={isFuture} onClick={() => selectWeightDay(i)} style={{
-                        padding: "6px 2px", borderRadius: 7, cursor: isFuture ? "default" : "pointer", fontFamily: "inherit", position: "relative",
-                        border: `1.5px solid ${isActive ? p.blue : val != null ? p.greenBorder : p.border}`,
-                        background: isActive ? p.blueLight : val != null ? p.greenLight : p.bg,
-                        opacity: isFuture ? 0.35 : 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
-                      }}>
-                        <span style={{ fontSize: 9, color: p.muted, fontWeight: 600 }}>{d}</span>
-                        <span style={{ fontSize: 8, color: p.dim, fontWeight: 500 }}>{fmtShort(cellDate)}</span>
-                        <span style={{ fontSize: 10, color: val != null ? p.green : p.dim, fontWeight: 600 }}>{val != null ? val : "–"}</span>
-                        {isToday && <span style={{ position: "absolute", top: 3, right: 3, width: 4, height: 4, borderRadius: "50%", background: p.blue }} />}
-                      </button>
-                    );
-                  })}
-                </div>
-                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                  <input type="number" step="0.1" min="40" max="200" placeholder="61.5" value={weightInput} onChange={e => setWeightInput(e.target.value)}
-                    style={{ flex: 1, padding: "10px 12px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, color: p.text, fontSize: 18, fontFamily: "inherit", outline: "none" }} />
-                  <span style={{ color: p.muted, fontSize: 12 }}>kg</span>
-                  <button onClick={saveWeight} style={{ padding: "10px 16px", background: p.blue, border: "none", borderRadius: 8, color: "#fff", fontWeight: 600, fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>Save</button>
-                  {dailyWeights[activeWeightDay] != null && (
-                    <button onClick={clearWeight} style={{ padding: "10px 12px", background: p.redLight, border: `1px solid ${p.redBorder}`, borderRadius: 8, color: p.red, fontWeight: 600, fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>Clear</button>
-                  )}
-                </div>
-                <div style={{ fontSize: 11, color: p.muted, marginTop: 7 }}>
-                  Editing <strong style={{ color: p.text }}>{DAY_LABELS[activeWeightDay]}</strong>{dailyWeights[activeWeightDay] != null && <span style={{ color: p.green }}> · ✓ saved</span>}
-                </div>
-              </div>
-            </div>
-
             {/* Note */}
             <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, overflow: "hidden" }}>
               <div style={{ padding: "12px 14px", borderBottom: `1px solid ${p.border}` }}>
@@ -1015,155 +769,108 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
         {/* ══ CHART ══ */}
         {view === "chart" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-            <div style={{ display: "flex", gap: 10 }}>
-              {[
-                { label: "Current", val: `${latestWeight.toFixed(1)} kg`, color: p.text },
-                { label: "Gained", val: `${latestWeight - goals.startWeight >= 0 ? "+" : ""}${(latestWeight - goals.startWeight).toFixed(1)} kg`, color: p.green },
-                { label: "To go", val: `${Math.max(0, goals.targetWeight - latestWeight).toFixed(1)} kg`, color: p.blue },
-              ].map(s => (
-                <div key={s.label} style={{ flex: 1, padding: "12px 8px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 10, textAlign: "center" }}>
-                  <div style={{ fontSize: 16, fontWeight: 700, color: s.color }}>{s.val}</div>
-                  <div style={{ fontSize: 9, color: p.muted, marginTop: 3, textTransform: "uppercase", letterSpacing: 1 }}>{s.label}</div>
-                </div>
+            {/* Range toggle */}
+            <div style={{ display: "flex", gap: 8 }}>
+              {["1M", "3M", "6M"].map(r => (
+                <button key={r} onClick={() => setChartRange(r)} style={{
+                  flex: 1, padding: "9px 0", borderRadius: 8, border: `1.5px solid ${chartRange === r ? p.blue : p.border}`,
+                  background: chartRange === r ? p.blueLight : p.white, color: chartRange === r ? p.blue : p.text,
+                  fontWeight: 600, fontSize: 13, cursor: "pointer", fontFamily: "inherit",
+                }}>{r}</button>
               ))}
             </div>
 
-            {gainRate && (
-              <div style={{ padding: "12px 14px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div>
-                  <div style={{ fontSize: 10, letterSpacing: 2, color: p.muted, textTransform: "uppercase", marginBottom: 3 }}>Weekly gain rate</div>
-                  <div style={{ fontSize: 13, color: gainColor(), fontWeight: 600 }}>{gainLabel()} — target 0.25–0.5 kg/wk</div>
-                </div>
-                <div style={{ fontSize: 22, fontWeight: 700, color: gainColor() }}>{gainRate > 0 ? "+" : ""}{gainRate}</div>
-              </div>
-            )}
-
-            <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, padding: "14px 8px 8px" }}>
-              <div style={{ fontSize: 10, letterSpacing: 2, color: p.muted, textTransform: "uppercase", padding: "0 8px", marginBottom: 10 }}>Weight (kg)</div>
-              <WeightChart data={chartData} target={goals.targetWeight} />
-            </div>
-
-            {/* Shake Heatmap */}
-            <div style={{ fontSize: 11, letterSpacing: 3, color: p.muted, textTransform: "uppercase", fontWeight: 500 }}>Shake Consistency</div>
             {(() => {
-              const startYear = 2026, startMonth = 6;
-              const nowD = new Date();
-              const canGoBack = heatmapYear > startYear || (heatmapYear === startYear && heatmapMonth > startMonth);
-              const canGoForward = heatmapYear < nowD.getFullYear() || (heatmapYear === nowD.getFullYear() && heatmapMonth < nowD.getMonth());
-              function prevM() { if (!canGoBack) return; if (heatmapMonth === 0) { setHeatmapYear(y=>y-1); setHeatmapMonth(11); } else setHeatmapMonth(m=>m-1); }
-              function nextM() { if (!canGoForward) return; if (heatmapMonth === 11) { setHeatmapYear(y=>y+1); setHeatmapMonth(0); } else setHeatmapMonth(m=>m+1); }
-              const days = getDaysInMonth(heatmapYear, heatmapMonth);
-              let morningCount = 0, nightCount = 0;
-              const dayData = days.map(dateStr => {
-                const dow = new Date(dateStr + "T00:00:00").getDay();
-                const wk = getSundayOfWeek(dateStr);
-                const s = getShakeStatus(logs, wk, dow);
-                if (s.morning) morningCount++;
-                if (s.night) nightCount++;
-                return { dateStr, morning: s.morning, night: s.night, future: dateStr > todayStr() };
+              const weeksInRange = getWeeksInRange(RANGE_DAYS[chartRange], startDate);
+              if (weeksInRange.length === 0) {
+                return <div style={{ textAlign: "center", color: p.dim, padding: "40px 0", fontSize: 13 }}>No fully completed weeks in this range yet.</div>;
+              }
+              const totalPossible = weeksInRange.length * 4;
+              let done = 0, skipped = 0;
+              weeksInRange.forEach(wk => {
+                const wl = logs[wk] || {};
+                SESSIONS.forEach(s => {
+                  const st = getEffectiveStatus(wl, s.id, wk);
+                  if (st === "done") done++;
+                  if (st === "skipped") skipped++;
+                });
               });
-              const firstDow = new Date(dayData[0].dateStr + "T00:00:00").getDay();
-              const cells = [...Array(firstDow).fill(null), ...dayData];
-              const weeks = [];
-              for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i+7));
+              const pct = totalPossible ? Math.round((done / totalPossible) * 100) : 0;
+              const weeksDesc = weeksInRange.slice().reverse();
+
               return (
-                <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, overflow: "hidden" }}>
-                  <div style={{ padding: "12px 14px", borderBottom: `1px solid ${p.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <button onClick={prevM} disabled={!canGoBack} style={{ background: "none", border: "none", cursor: canGoBack ? "pointer" : "default", color: canGoBack ? p.text : p.dim, fontSize: 18, padding: "0 4px" }}>‹</button>
-                    <div style={{ textAlign: "center" }}>
-                      <div style={{ fontSize: 13, fontWeight: 600 }}>{MONTH_NAMES[heatmapMonth]} {heatmapYear}</div>
-                      <div style={{ display: "flex", gap: 10, fontSize: 10, color: p.muted, marginTop: 2, justifyContent: "center" }}>
-                        <span><span style={{ display: "inline-block", width: 8, height: 8, background: p.green, borderRadius: 2, marginRight: 3 }} />Morning</span>
-                        <span><span style={{ display: "inline-block", width: 8, height: 8, background: p.blue, borderRadius: 2, marginRight: 3 }} />Night</span>
-                      </div>
-                    </div>
-                    <button onClick={nextM} disabled={!canGoForward} style={{ background: "none", border: "none", cursor: canGoForward ? "pointer" : "default", color: canGoForward ? p.text : p.dim, fontSize: 18, padding: "0 4px" }}>›</button>
-                  </div>
-                  <div style={{ padding: "12px 14px" }}>
-                    <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, marginBottom: 6 }}>
-                      {DAY_LABELS.map(d => <div key={d} style={{ textAlign: "center", fontSize: 9, color: p.muted, fontWeight: 600 }}>{d}</div>)}
-                    </div>
-                    {weeks.map((week, wi) => (
-                      <div key={`w-${wi}`} style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, marginBottom: 3 }}>
-                        {[...week, ...Array(7-week.length).fill(null)].map((cell, ci) => (
-                          <div key={ci} style={{ height: 22, borderRadius: 3, overflow: "hidden", opacity: !cell ? 0 : cell.future ? 0.25 : 1, display: "flex", flexDirection: "column", gap: 1 }}>
-                            <div style={{ flex: 1, background: !cell ? "transparent" : cell.morning ? p.green : p.border }} />
-                            <div style={{ flex: 1, background: !cell ? "transparent" : cell.night ? p.blue : p.border }} />
-                          </div>
-                        ))}
+                <>
+                  {/* Aggregated summary */}
+                  <div style={{ display: "flex", gap: 10 }}>
+                    {[
+                      { label: "Done", val: `${done}/${totalPossible}`, color: p.green },
+                      { label: "Skipped", val: skipped, color: p.red },
+                      { label: "Completion", val: `${pct}%`, color: p.blue },
+                    ].map(s => (
+                      <div key={s.label} style={{ flex: 1, padding: "12px 8px", background: p.white, border: `1px solid ${p.border}`, borderRadius: 10, textAlign: "center" }}>
+                        <div style={{ fontSize: 16, fontWeight: 700, color: s.color }}>{s.val}</div>
+                        <div style={{ fontSize: 9, color: p.muted, marginTop: 3, textTransform: "uppercase", letterSpacing: 1 }}>{s.label}</div>
                       </div>
                     ))}
-                    <div style={{ marginTop: 12, padding: "10px 12px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, display: "flex", justifyContent: "space-between", fontSize: 12 }}>
-                      <span>🌅 <strong style={{ color: p.green }}>{morningCount}</strong><span style={{ color: p.muted }}>/{days.length}</span></span>
-                      <span>🌙 <strong style={{ color: p.blue }}>{nightCount}</strong><span style={{ color: p.muted }}>/{days.length}</span></span>
-                      <span style={{ color: p.muted }}>{Math.round(((morningCount+nightCount)/(days.length*2))*100)}% overall</span>
+                  </div>
+
+                  {/* Shake consistency trend */}
+                  <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, overflow: "hidden" }}>
+                    <div style={{ padding: "12px 14px", borderBottom: `1px solid ${p.border}` }}>
+                      <span style={{ fontSize: 11, letterSpacing: 3, color: p.muted, textTransform: "uppercase", fontWeight: 500 }}>Shake Consistency</span>
+                    </div>
+                    <div style={{ padding: "12px 14px", display: "flex", flexDirection: "column", gap: 7 }}>
+                      {weeksDesc.map(wk => {
+                        const sc = getWeekShakeCount(logs, wk);
+                        const scPct = Math.round((sc / 7) * 100);
+                        return (
+                          <div key={wk} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            <div style={{ width: 52, fontSize: 10, color: p.muted }}>{fmtShort(wk)}</div>
+                            <div style={{ flex: 1, height: 14, background: p.bg, borderRadius: 7, overflow: "hidden" }}>
+                              <div style={{ width: `${scPct}%`, height: "100%", background: p.green, borderRadius: 7 }} />
+                            </div>
+                            <div style={{ width: 40, textAlign: "right", fontSize: 11, color: p.text, fontWeight: 600 }}>{sc}/7</div>
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
-                </div>
-              );
-            })()}
 
-            {/* Training Heatmap */}
-            <div style={{ fontSize: 11, letterSpacing: 3, color: p.muted, textTransform: "uppercase", fontWeight: 500 }}>Training Consistency</div>
-            {(() => {
-              const startYear = 2026, startMonth = 6;
-              const nowD = new Date();
-              const canGoBack = exHeatmapYear > startYear || (exHeatmapYear === startYear && exHeatmapMonth > startMonth);
-              const canGoForward = exHeatmapYear < nowD.getFullYear() || (exHeatmapYear === nowD.getFullYear() && exHeatmapMonth < nowD.getMonth());
-              function prevM() { if (!canGoBack) return; if (exHeatmapMonth === 0) { setExHeatmapYear(y=>y-1); setExHeatmapMonth(11); } else setExHeatmapMonth(m=>m-1); }
-              function nextM() { if (!canGoForward) return; if (exHeatmapMonth === 11) { setExHeatmapYear(y=>y+1); setExHeatmapMonth(0); } else setExHeatmapMonth(m=>m+1); }
-              const days = getDaysInMonth(exHeatmapYear, exHeatmapMonth);
-              const weeksInMonth = [...new Set(days.map(d => getSundayOfWeek(d)))];
-              const totalSessions = weeksInMonth.length * 4;
-              let doneSessions = 0, skippedSessions = 0;
-              const weekRows = weeksInMonth.map(wk => {
-                const s = (logs[wk] || {}).sessions || {};
-                const startOfWeek = new Date(wk + "T00:00:00");
-                const weekLabel = `${startOfWeek.getDate()} ${MONTH_NAMES[startOfWeek.getMonth()]}`;
-                const sessionData = SESSIONS.map(sess => {
-                  const status = s[sess.id];
-                  if (status === "done") doneSessions++;
-                  if (status === "skipped") skippedSessions++;
-                  return { id: sess.id, label: sess.label, status };
-                });
-                return { wk, weekLabel, sessionData, isFuture: wk > getSundayOfWeek(todayStr()) };
-              });
-              return (
-                <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, overflow: "hidden" }}>
-                  <div style={{ padding: "12px 14px", borderBottom: `1px solid ${p.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <button onClick={prevM} disabled={!canGoBack} style={{ background: "none", border: "none", cursor: canGoBack ? "pointer" : "default", color: canGoBack ? p.text : p.dim, fontSize: 18, padding: "0 4px" }}>‹</button>
-                    <div style={{ textAlign: "center" }}>
-                      <div style={{ fontSize: 13, fontWeight: 600 }}>{MONTH_NAMES[exHeatmapMonth]} {exHeatmapYear}</div>
-                      <div style={{ display: "flex", gap: 10, fontSize: 10, color: p.muted, marginTop: 2, justifyContent: "center" }}>
+                  {/* Week by week rows + compliance score */}
+                  <div style={{ background: p.white, border: `1px solid ${p.border}`, borderRadius: 12, overflow: "hidden" }}>
+                    <div style={{ padding: "12px 14px", borderBottom: `1px solid ${p.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ fontSize: 11, letterSpacing: 3, color: p.muted, textTransform: "uppercase", fontWeight: 500 }}>Training</span>
+                      <div style={{ display: "flex", gap: 10, fontSize: 9, color: p.muted }}>
                         <span><span style={{ display: "inline-block", width: 8, height: 8, background: p.green, borderRadius: 2, marginRight: 3 }} />Done</span>
                         <span><span style={{ display: "inline-block", width: 8, height: 8, background: p.red, borderRadius: 2, marginRight: 3 }} />Skipped</span>
                         <span><span style={{ display: "inline-block", width: 8, height: 8, background: p.border, borderRadius: 2, marginRight: 3 }} />Not logged</span>
                       </div>
                     </div>
-                    <button onClick={nextM} disabled={!canGoForward} style={{ background: "none", border: "none", cursor: canGoForward ? "pointer" : "default", color: canGoForward ? p.text : p.dim, fontSize: 18, padding: "0 4px" }}>›</button>
+                    <div style={{ padding: "12px 14px" }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "52px repeat(4, 1fr) 44px", gap: 4, marginBottom: 8 }}>
+                        <div />
+                        {SESSIONS.map(s => <div key={s.id} style={{ textAlign: "center", fontSize: 8, color: p.muted, fontWeight: 600 }}>{s.label}</div>)}
+                        <div style={{ textAlign: "center", fontSize: 8, color: p.muted, fontWeight: 600 }}>Score</div>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                        {weeksDesc.map(wk => {
+                          const wl = logs[wk] || {};
+                          const score = getWeekCompliance(logs, wk);
+                          return (
+                            <div key={wk} style={{ display: "grid", gridTemplateColumns: "52px repeat(4, 1fr) 44px", gap: 4, alignItems: "center" }}>
+                              <div style={{ fontSize: 9, color: p.muted }}>{fmtShort(wk)}</div>
+                              {SESSIONS.map(s => {
+                                const st = getEffectiveStatus(wl, s.id, wk);
+                                return <div key={s.id} style={{ height: 28, borderRadius: 6, background: st === "done" ? p.green : st === "skipped" ? p.red : p.border, opacity: st ? 1 : 0.35 }} />;
+                              })}
+                              <div style={{ textAlign: "center", fontSize: 11, fontWeight: 700, color: score >= 75 ? p.green : score >= 40 ? p.amber : p.red }}>{score}%</div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
                   </div>
-                  <div style={{ padding: "12px 14px" }}>
-                    <div style={{ display: "grid", gridTemplateColumns: "52px repeat(4, 1fr)", gap: 4, marginBottom: 8 }}>
-                      <div />
-                      {SESSIONS.map(s => <div key={s.id} style={{ textAlign: "center", fontSize: 8, color: p.muted, fontWeight: 600 }}>{s.label}</div>)}
-                    </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      {weekRows.map(({ wk, weekLabel, sessionData, isFuture }) => (
-                        <div key={wk} style={{ display: "grid", gridTemplateColumns: "52px repeat(4, 1fr)", gap: 4, alignItems: "center" }}>
-                          <div style={{ fontSize: 9, color: p.muted }}>{weekLabel}</div>
-                          {sessionData.map(sess => (
-                            <div key={sess.id} style={{ height: 28, borderRadius: 6, background: isFuture ? p.border : sess.status === "done" ? p.green : sess.status === "skipped" ? p.red : p.border, opacity: isFuture ? 0.2 : sess.status ? 1 : 0.35 }} />
-                          ))}
-                        </div>
-                      ))}
-                    </div>
-                    <div style={{ marginTop: 12, padding: "10px 12px", background: p.bg, border: `1px solid ${p.border}`, borderRadius: 8, display: "flex", justifyContent: "space-between", fontSize: 12 }}>
-                      <span>💪 <strong style={{ color: p.green }}>{doneSessions}</strong><span style={{ color: p.muted }}>/{totalSessions} done</span></span>
-                      <span>❌ <strong style={{ color: p.red }}>{skippedSessions}</strong><span style={{ color: p.muted }}> skipped</span></span>
-                      <span style={{ color: p.muted }}>{totalSessions > 0 ? Math.round((doneSessions/totalSessions)*100) : 0}%</span>
-                    </div>
-                  </div>
-                </div>
+                </>
               );
             })()}
 
@@ -1174,7 +881,7 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
               </div>
               <div style={{ padding: "12px 14px" }}>
                 {(() => {
-                  const breakdown = getWorkoutDayBreakdown(logs, goals.startDate);
+                  const breakdown = getWorkoutDayBreakdown(logs, startDate);
                   const totalDone = breakdown.reduce((a, b) => a + b.count, 0);
                   if (!totalDone) {
                     return <div style={{ textAlign: "center", color: p.dim, padding: "16px 0", fontSize: 12 }}>No completed sessions with a recorded day yet.</div>;
@@ -1202,29 +909,26 @@ function Tracker({ auth, initialLogs, initialGoals, initialSyncStatus, onDisconn
         {/* ══ HISTORY ══ */}
         {view === "history" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {getAllLoggedWeekKeys(logs, goals.startDate).length === 0 ? (
+            {getAllLoggedWeekKeys(logs, startDate).length === 0 ? (
               <div style={{ textAlign: "center", color: p.dim, padding: "60px 0", fontSize: 13 }}>No history yet — start logging!</div>
             ) : (
-              getAllLoggedWeekKeys(logs, goals.startDate).slice().reverse().map(wk => {
+              getAllLoggedWeekKeys(logs, startDate).slice().reverse().map(wk => {
                 const wl = logs[wk] || {};
-                const done = Object.values(wl.sessions || {}).filter(v => v === "done").length;
-                const ms = getWeekShakeCount(wk, "morning");
-                const ns = getWeekShakeCount(wk, "night");
-                const isGood = done >= 3, isBad = done <= 1;
-                const avgW = getWeekWeightAvg(logs, wk);
-                const daysLogged = Object.keys(wl.dailyWeights || {}).length;
+                const done = SESSIONS.filter(s => getEffectiveStatus(wl, s.id, wk) === "done").length;
+                const skipped = SESSIONS.filter(s => getEffectiveStatus(wl, s.id, wk) === "skipped").length;
+                const sc = getWeekShakeCount(logs, wk);
+                const score = getWeekCompliance(logs, wk);
+                const isGood = score >= 75, isBad = score < 40;
                 return (
                   <div key={wk} style={{ background: p.white, border: `1px solid ${isGood ? p.greenBorder : isBad ? p.redBorder : p.border}`, borderRadius: 12, overflow: "hidden" }}>
                     <div style={{ padding: "11px 14px", background: isGood ? p.greenLight : isBad ? p.redLight : p.white, borderBottom: `1px solid ${p.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                       <span style={{ fontSize: 11, color: p.muted, textTransform: "uppercase", letterSpacing: 1 }}>Week of {fmtShort(wk)}</span>
-                      <span style={{ fontSize: 18, fontWeight: 700, color: isGood ? p.green : isBad ? p.red : p.text }}>
-                        {avgW != null ? avgW.toFixed(1) : "–"} kg{daysLogged > 1 && <span style={{ fontSize: 10, color: p.muted, fontWeight: 400 }}> (avg of {daysLogged})</span>}
-                      </span>
+                      <span style={{ fontSize: 18, fontWeight: 700, color: isGood ? p.green : isBad ? p.red : p.text }}>{score}%</span>
                     </div>
                     <div style={{ padding: "9px 14px", display: "flex", gap: 14, fontSize: 11, color: p.muted, flexWrap: "wrap" }}>
-                      <span>💪 {done}/4</span>
-                      <span>🌅 {ms}/7</span>
-                      <span>🌙 {ns}/7</span>
+                      <span>💪 {done}/4 done</span>
+                      {skipped > 0 && <span>❌ {skipped} skipped</span>}
+                      <span>🥤 {sc}/7 shakes</span>
                       {wl.note && <span style={{ color: p.text }}>📝 {wl.note}</span>}
                     </div>
                   </div>
